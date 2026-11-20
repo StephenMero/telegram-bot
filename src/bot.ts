@@ -25,6 +25,7 @@ import {
   type AuditFileSummary,
   type AuditLog,
 } from "./audit.js";
+import { registerBroadcastCommand } from "./commands/broadcast.js";
 
 const HELP_BASE = [
   "*Mimir notifier*",
@@ -43,6 +44,7 @@ function helpMessage(config: BotConfig): string {
   if (config.operatorTelegramUserId === null) return HELP_BASE.join("\n");
   return [
     ...HELP_BASE.slice(0, -1),
+    "/broadcast — operator only: broadcast a message to all chats",
     "/pause — operator only: pause scheduling new scans",
     "/resume — operator only: resume polling now",
     HELP_BASE.at(-1) as string,
@@ -273,6 +275,11 @@ export interface BotDeps {
   botInfo?: UserFromGetMe;
   pause: () => PollerPauseResult;
   resume: () => PollerResumeResult;
+  /**
+   * Optional send override for the /broadcast command's delivery step. When
+   * provided (e.g. in tests), broadcast uses this instead of bot.api.sendMessage.
+   */
+  broadcastSend?: ((chatId: string, text: string) => Promise<unknown>) | undefined;
 }
 
 /**
@@ -301,6 +308,7 @@ const AUDIT_TAIL = 10;
 /** Register command handlers on a grammy-compatible bot (also useful in tests). */
 export function registerCommandHandlers(bot: Bot, deps: BotDeps): void {
   const { config, status, pause, resume } = deps;
+  registerBroadcastCommand(bot, { config, sendMessage: deps.broadcastSend });
 
   bot.command("start", async (ctx) => {
     await ctx.reply(helpMessage(config), TELEGRAM_OPTIONS);
@@ -518,6 +526,7 @@ export async function registerCommands(bot: Bot): Promise<void> {
       { command: "contracts", description: "Contract ids and explorer links" },
       { command: "health", description: "Health assessment and operational readiness" },
       { command: "preview", description: "Preview channel notification formatting" },
+      { command: "broadcast", description: "Operator only: broadcast a message to all chats" },
       { command: "pause", description: "Operator only: pause new scans" },
       { command: "resume", description: "Operator only: resume polling now" },
     ]);
