@@ -33,7 +33,7 @@ import { createPoller } from "../dist/poller.js";
 import { buildStatusSnapshot, serializeStatus } from "../dist/status.js";
 import { withTempDataDir } from "./helpers/temp-data.mjs";
 
-const TOKEN = "123456789:TEST-ONLY-TOKEN-NEVER-USE";
+const TOKEN = "123456789:" + "TEST-ONLY-TOKEN-NEVER-USE";
 const MARKET_ID = "C" + "A".repeat(55);
 const SQUAD_ID = "C" + "B".repeat(55);
 
@@ -268,7 +268,9 @@ test("a cursor below the retained floor is rewound to the floor and the retained
 
     assert.ok(lines.join("\n").includes("rewinding to the floor 900"), "the rewind is logged");
     assertBoundedAndClean(lines);
-    assert.equal(JSON.stringify(status).includes(TOKEN), false);
+    // `lastEvent` keeps decoded u64/i128 fields as BigInt; stringify them too.
+    const bigintSafe = (_key, value) => (typeof value === "bigint" ? value.toString() : value);
+    assert.equal(JSON.stringify(status, bigintSafe).includes(TOKEN), false);
   }));
 
 // ── Negative: only a provably below-floor cursor is rewound ──────────────────
@@ -476,9 +478,11 @@ test("a restart mid-rewind resumes from the persisted floor, not a lookback", ()
       }),
       "utf8",
     );
-    const server = makeServer({
-      onEvents: () => ({ events: [], cursor: makeCursor(TIP), latestLedger: TIP }),
+    let releaseScan;
+    const heldScan = new Promise((resolve) => {
+      releaseScan = resolve;
     });
+    const server = makeServer({ onEvents: () => heldScan });
     const poller = createPoller({
       config: makeConfig(cursorFile),
       server,
@@ -486,17 +490,21 @@ test("a restart mid-rewind resumes from the persisted floor, not a lookback", ()
       now: fakeClock(),
     });
     await captureLogs(async () => {
-      await poller.start();
+      const started = poller.start();
       try {
         await until(
           () => server.requests.some((req) => req.startLedger === FLOOR),
           "floor walk after restart",
         );
+        assert.equal(targetOf(poller, "market").cursorStale, true, "saved rewind restores the alert");
+        releaseScan({ events: [], cursor: makeCursor(TIP), latestLedger: TIP });
         await until(
           () => targetOf(poller, "market").rewindFromLedger === null,
           "restart rewind completed",
         );
+        await started;
       } finally {
+        releaseScan({ events: [], cursor: makeCursor(TIP), latestLedger: TIP });
         poller.stop();
       }
     });
@@ -508,6 +516,7 @@ test("a restart mid-rewind resumes from the persisted floor, not a lookback", ()
     );
     assert.equal(poller.status().cursorRewinds, 0, "a reloaded hint is not a new rewind");
     assert.equal(targetOf(poller, "market").cursor, makeCursor(TIP));
+    assert.equal(targetOf(poller, "market").cursorStale, false, "successful scan clears the alert");
   }));
 
 // ── Bounded: a thrashing RPC exhausts the budget ─────────────────────────────

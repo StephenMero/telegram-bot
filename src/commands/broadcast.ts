@@ -1,275 +1,423 @@
 /**
- * Operator /broadcast command: send a message to all configured chats.
+ * Operator maintenance broadcast command.
  *
- * Usage: /broadcast <message text>
- *
- * Flow:
- *  1. Operator sends `/broadcast Hello everyone`.
- *  2. The bot replies with a confirmation message bearing two inline buttons:
- *     "✅ Confirm" and "❌ Cancel". The buttons carry callback data of the form
- *     "broadcast:confirm:<token>" and "broadcast:cancel:<token>".
- *  3. The token is a short random id tied to a pending broadcast entry in an
- *     in-memory table, bounded by MAX_PENDING_BROADCASTS.
- *  4. When the operator presses a button:
- *     - Confirm: the message is sent to all configured chats and the
- *       confirmation message is edited to show the outcome.
- *     - Cancel: the pending broadcast is removed and the confirmation message
- *       is edited to show it was cancelled.
- *  5. If the confirmation message was deleted before the button was pressed,
- *     handleCallbackQuery() catches the error, clears the spinner, and sends a
- *     fallback reply. The state transition (send / cancel) does not repeat.
- *  6. After the first button press the pending entry is consumed (removed from
- *     the table). A second press of the same token finds no entry and is a
- *     no-op — the confirmation message was already edited and the action ran.
- *
- * The in-memory table is intentionally ephemeral: a process restart discards
- * all pending broadcasts. Operators who need durability should restart with
- * enough time for confirmations to be acted on before the process exits.
- *
- * Security: only the configured operator (OPERATOR_TELEGRAM_USER_ID) may
- * invoke /broadcast or act on its confirmation buttons. Non-operator callbacks
- * are silently ignored. Token guessing is infeasible at 48 bits of randomness.
+ * Allows the operator to send an announcement to all configured notification chats
+ * from a private chat session. Displays a confirmation preview with Confirm/Cancel
+ * inline buttons, bounds the message length, expires pending confirmations, and
+ * delivers plain text (no parse mode) to each unique configured chat with an
+ * inter-send delay while reporting per-chat success.
  */
 
-import { randomBytes } from "node:crypto";
-
-import type { Bot } from "grammy";
-
-import { handleCallbackQuery, type CallbackContext } from "../callbacks.js";
+import { Bot, InlineKeyboard, type Context, type CommandContext } from "grammy";
 import type { BotConfig } from "../config.js";
+import { isOperator, safeAnswerCallback } from "./runtime.js";
+import type { CommandDeps as BotDeps } from "./registry.js";
 import { safeErrorMessage } from "../notifications/format.js";
 
-/** Maximum concurrent pending broadcast confirmations. Oldest evicted first. */
-const MAX_PENDING_BROADCASTS = 20;
+/** Telegram Bot API maximum message length limit. */
+export const MAX_BROADCAST_LENGTH = 4096;
 
-/** Callback data prefix for this command's buttons. */
-const BROADCAST_PREFIX = "broadcast:";
+/** Default expiration timeout for pending broadcast confirmations (5 minutes). */
+export const DEFAULT_BROADCAST_EXPIRY_MS = 5 * 60 * 1000;
 
-/** Tokens are 6 random bytes encoded as hex (12 hex chars, 48 bits). */
-function newToken(): string {
-  return randomBytes(6).toString("hex");
+export const BROADCAST_USAGE_MESSAGE = "Usage: /broadcast <message>";
+export const BROADCAST_TOO_LONG_MESSAGE =
+  "Broadcast message exceeds the maximum length of 4096 characters.";
+export const BROADCAST_NO_CHATS_MESSAGE = "No notification chats configured.";
+
+/**
+ * Extracts and deduplicates all unique configured notification chats from config.
+ * Chats come from TELEGRAM_CHAT_ID (chatId / chatIds), TELEGRAM_MARKET_CHAT_ID,
+ * and TELEGRAM_SQUAD_CHAT_ID.
+ */
+export function getConfiguredBroadcastChats(
+  config: Pick<BotConfig, "chatId"> &
+    Partial<Pick<BotConfig, "chatIds" | "marketChatId" | "squadChatId">>,
+): string[] {
+  const candidates: string[] = [];
+  if (Array.isArray(config.chatIds) && config.chatIds.length > 0) {
+    candidates.push(...config.chatIds);
+  } else if (config.chatId) {
+    candidates.push(config.chatId);
+  }
+  if (config.marketChatId) {
+    candidates.push(config.marketChatId);
+  }
+  if (config.squadChatId) {
+    candidates.push(config.squadChatId);
+  }
+
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const raw of candidates) {
+    const trimmed = typeof raw === "string" ? raw.trim() : String(raw ?? "").trim();
+    if (trimmed.length > 0 && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      unique.push(trimmed);
+    }
+  }
+
+  // Fallback to process.env if config yielded no chats
+  if (unique.length === 0 && typeof process !== "undefined" && process.env) {
+    const envSources = [
+      process.env.TELEGRAM_CHAT_ID,
+      process.env.TELEGRAM_MARKET_CHAT_ID,
+      process.env.TELEGRAM_SQUAD_CHAT_ID,
+    ];
+    for (const raw of envSources) {
+      if (raw) {
+        for (const part of raw.split(",")) {
+          const trimmed = part.trim();
+          if (trimmed.length > 0 && !seen.has(trimmed)) {
+            seen.add(trimmed);
+            unique.push(trimmed);
+          }
+        }
+      }
+    }
+  }
+
+  return unique;
 }
 
 export interface PendingBroadcast {
-  token: string;
-  text: string;
-  chatIds: string[];
-  operatorChatId: number;
+  id: string;
+  operatorId: string;
+  message: string;
+  createdAt: number;
+  expiresAt: number;
+  chats: readonly string[];
+  confirmed: boolean;
 }
 
-/**
- * Bounded in-memory store for pending broadcast confirmations.
- *
- * Uses insertion order to evict oldest entries when the cap is reached. Tokens
- * are single-use: once consumed (confirmed or cancelled) the entry is removed
- * and a repeated callback for the same token is a no-op.
- */
-export class PendingBroadcastStore {
-  private readonly entries = new Map<string, PendingBroadcast>();
-  private readonly max: number;
+export class BroadcastStore {
+  private readonly items = new Map<string, PendingBroadcast>();
+  private readonly defaultTtlMs: number;
+  private counter = 0;
 
-  constructor(max = MAX_PENDING_BROADCASTS) {
-    this.max = max;
+  constructor(defaultTtlMs: number = DEFAULT_BROADCAST_EXPIRY_MS) {
+    this.defaultTtlMs = defaultTtlMs;
   }
 
-  add(entry: PendingBroadcast): void {
-    if (this.entries.size >= this.max) {
-      // Evict the oldest entry (insertion-order first key).
-      const oldestKey = this.entries.keys().next().value;
-      if (oldestKey !== undefined) this.entries.delete(oldestKey);
+  create(
+    operatorId: string,
+    message: string,
+    chats: readonly string[],
+    ttlMs?: number,
+  ): PendingBroadcast {
+    this.cleanup();
+    this.counter = (this.counter + 1) % 1_000_000;
+    const id = `${Date.now().toString(36)}_${this.counter}_${Math.random().toString(36).slice(2, 6)}`;
+    const now = Date.now();
+    const item: PendingBroadcast = {
+      id,
+      operatorId,
+      message,
+      createdAt: now,
+      expiresAt: now + (ttlMs ?? this.defaultTtlMs),
+      chats,
+      confirmed: false,
+    };
+    this.items.set(id, item);
+    return item;
+  }
+
+  get(id: string, now: number = Date.now()): PendingBroadcast | undefined {
+    this.cleanup(now);
+    return this.items.get(id);
+  }
+
+  delete(id: string): boolean {
+    return this.items.delete(id);
+  }
+
+  cleanup(now: number = Date.now()): void {
+    for (const [id, item] of this.items.entries()) {
+      if (item.expiresAt <= now) {
+        this.items.delete(id);
+      }
     }
-    this.entries.set(entry.token, entry);
   }
 
-  consume(token: string): PendingBroadcast | undefined {
-    const entry = this.entries.get(token);
-    if (entry) this.entries.delete(token);
-    return entry;
+  clear(): void {
+    this.items.clear();
   }
 
   size(): number {
-    return this.entries.size;
+    return this.items.size;
   }
+}
+
+export const defaultBroadcastStore = new BroadcastStore();
+
+export function broadcastKeyboard(id: string): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("✅ Confirm", `broadcast:confirm:${id}`)
+    .text("❌ Cancel", `broadcast:cancel:${id}`);
+}
+
+export function formatBroadcastPreview(message: string, chats: readonly string[]): string {
+  const chatList = chats.map((c) => `• ${c}`).join("\n");
+  return (
+    `📢 Broadcast Preview\n\n` +
+    `Target chats (${chats.length}):\n${chatList}\n\n` +
+    `Message:\n${message}\n\n` +
+    `Click Confirm to send or Cancel to abort.`
+  );
+}
+
+export interface BroadcastResult {
+  chatId: string;
+  ok: boolean;
+  error?: string;
+}
+
+export async function sendBroadcast(params: {
+  api: { sendMessage: (chatId: string | number, text: string, options?: any) => Promise<any> };
+  chats: readonly string[];
+  message: string;
+  interSendDelayMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+}): Promise<BroadcastResult[]> {
+  const { api, chats, message, interSendDelayMs = 0 } = params;
+  const sleepFn = params.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const results: BroadcastResult[] = [];
+
+  for (let i = 0; i < chats.length; i++) {
+    const chatId = chats[i]!;
+    if (i > 0 && interSendDelayMs > 0) {
+      await sleepFn(interSendDelayMs);
+    }
+    try {
+      // Plain text send: no parse_mode option specified
+      await api.sendMessage(chatId, message, {
+        link_preview_options: { is_disabled: true },
+      });
+      results.push({ chatId, ok: true });
+    } catch (err) {
+      const errMsg = safeErrorMessage(err);
+      results.push({ chatId, ok: false, error: errMsg });
+    }
+  }
+
+  return results;
+}
+
+export function formatBroadcastReport(results: readonly BroadcastResult[]): string {
+  const succeeded = results.filter((r) => r.ok).length;
+  const total = results.length;
+  const lines: string[] = [
+    `📢 Broadcast Results: ${succeeded}/${total} succeeded`,
+    "",
+  ];
+  for (const r of results) {
+    if (r.ok) {
+      lines.push(`• ${r.chatId}: sent`);
+    } else {
+      lines.push(`• ${r.chatId}: failed (${r.error ?? "unknown error"})`);
+    }
+  }
+  return lines.join("\n");
 }
 
 export interface BroadcastDeps {
   config: BotConfig;
-  /**
-   * Chat ids to send the broadcast to. Defaults to all configured chats
-   * (chatId, marketChatId, squadChatId) deduplicated. Provided here so tests
-   * can supply a simple override without constructing a full config.
-   */
-  targetChatIds?: string[] | undefined;
-  store?: PendingBroadcastStore | undefined;
-  /**
-   * The API method used to send messages to target chats. Defaults to
-   * bot.api.sendMessage. Injected in tests to avoid real Telegram calls.
-   */
-  sendMessage?: ((chatId: string, text: string) => Promise<unknown>) | undefined;
+  broadcastStore?: BroadcastStore;
+  broadcastExpiryMs?: number;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /**
- * Derive the list of target chats from the config, deduplicated, in a
- * consistent order. marketChatId and squadChatId override the fallback chatId
- * per contract, so each distinct value is included once.
+ * Handle /broadcast <message> command.
+ * Restricted to operator in private chats only.
  */
-export function targetChatIds(config: BotConfig): string[] {
-  const seen = new Set<string>();
-  const ids: string[] = [];
-  for (const id of [config.chatId, config.marketChatId, config.squadChatId]) {
-    if (id && !seen.has(id)) {
-      seen.add(id);
-      ids.push(id);
-    }
-  }
-  return ids;
-}
-
-function isOperatorUser(ctx: { from?: { id: number } | undefined }, config: BotConfig): boolean {
-  const operatorId = config.operatorTelegramUserId;
-  return operatorId !== null && ctx.from?.id.toString() === operatorId;
-}
-
-/** Build the inline keyboard for a pending broadcast confirmation. */
-function confirmKeyboard(token: string) {
-  return {
-    inline_keyboard: [
-      [
-        { text: "✅ Confirm", callback_data: `${BROADCAST_PREFIX}confirm:${token}` },
-        { text: "❌ Cancel", callback_data: `${BROADCAST_PREFIX}cancel:${token}` },
-      ],
-    ],
-  };
-}
-
-/**
- * Register the /broadcast command and its callback handler on `bot`.
- *
- * Both the command and the callback handler enforce operator-only access.
- * The callback handler uses `handleCallbackQuery` so a deleted confirmation
- * message is recovered without leaving the spinner stuck.
- */
-export function registerBroadcastCommand(bot: Bot, deps: BroadcastDeps): void {
+export async function handleBroadcastCommand(
+  ctx: CommandContext<Context>,
+  deps: Pick<BotDeps, "config"> & {
+    broadcastStore?: BroadcastStore;
+    broadcastExpiryMs?: number;
+  },
+): Promise<void> {
   const { config } = deps;
-  const store = deps.store ?? new PendingBroadcastStore();
+  const isPrivate = ctx.chat?.type === "private";
 
-  async function sendToTargets(
-    text: string,
-    chatIds: string[],
-    send: (chatId: string, text: string) => Promise<unknown>,
-  ): Promise<{ sent: number; failed: number }> {
-    let sent = 0;
-    let failed = 0;
-    for (const chatId of chatIds) {
+  if (!isOperator(ctx, config) || !isPrivate) {
+    console.warn(`[bot] ignored unauthorized /broadcast on update ${ctx.update?.update_id}`);
+    return;
+  }
+
+  const rawText = ctx.message?.text ?? "";
+  const match = rawText.match(/^\/broadcast(?:@\w+)?(?:\s+([\s\S]*))?$/);
+  const text = (match?.[1] ?? "").trim();
+
+  if (!text) {
+    await ctx.reply(BROADCAST_USAGE_MESSAGE);
+    return;
+  }
+
+  if (text.length > MAX_BROADCAST_LENGTH) {
+    await ctx.reply(BROADCAST_TOO_LONG_MESSAGE);
+    return;
+  }
+
+  const chats = getConfiguredBroadcastChats(config);
+  if (chats.length === 0) {
+    await ctx.reply(BROADCAST_NO_CHATS_MESSAGE);
+    return;
+  }
+
+  const store = deps.broadcastStore ?? defaultBroadcastStore;
+  const pending = store.create(
+    String(ctx.from?.id),
+    text,
+    chats,
+    deps.broadcastExpiryMs,
+  );
+
+  const previewText = formatBroadcastPreview(text, chats);
+  const keyboard = broadcastKeyboard(pending.id);
+
+  await ctx.reply(previewText, {
+    reply_markup: keyboard,
+    link_preview_options: { is_disabled: true },
+  });
+}
+
+/**
+ * Handle confirmation or cancellation callback queries for broadcast.
+ */
+export async function handleBroadcastCallback(
+  ctx: Context,
+  deps: BotDeps & {
+    broadcastStore?: BroadcastStore;
+    sleep?: (ms: number) => Promise<void>;
+  },
+  rawAction: string,
+): Promise<void> {
+  const { config } = deps;
+  const chatType = ctx.chat?.type ?? (ctx.callbackQuery?.message as any)?.chat?.type;
+  const isPrivate = chatType === "private";
+
+  if (!isOperator(ctx, config) || !isPrivate) {
+    console.warn(
+      `[bot] ignored unauthorized broadcast callback on update ${ctx.update?.update_id}`,
+    );
+    await safeAnswerCallback(ctx, config, {
+      text: "Unauthorized: operator in private chat only",
+      show_alert: true,
+    });
+    return;
+  }
+
+  const parts = rawAction.split(":");
+  const subAction = parts[1];
+  const broadcastId = parts[2];
+
+  if (!broadcastId || (subAction !== "confirm" && subAction !== "cancel")) {
+    await safeAnswerCallback(ctx, config, { text: "Invalid broadcast action" });
+    return;
+  }
+
+  const store = deps.broadcastStore ?? defaultBroadcastStore;
+  const pending = store.get(broadcastId);
+
+  if (!pending) {
+    await safeAnswerCallback(ctx, config, {
+      text: "Broadcast expired or already processed",
+      show_alert: true,
+    });
+    if (ctx.callbackQuery?.message) {
       try {
-        await send(chatId, text);
-        sent += 1;
-      } catch (err: unknown) {
-        console.warn(
-          `[broadcast] send to chat ${chatId} failed: ${safeErrorMessage(err, [config.botToken])}`,
-        );
-        failed += 1;
+        await ctx.editMessageText("⚠️ Broadcast confirmation expired or already processed.");
+      } catch {
+        // ignore edit failure
       }
     }
-    return { sent, failed };
+    return;
   }
 
-  bot.command("broadcast", async (ctx) => {
-    if (!isOperatorUser(ctx, config)) {
-      console.warn(`[broadcast] ignored unauthorized /broadcast on update ${ctx.update.update_id}`);
-      return;
+  if (Date.now() > pending.expiresAt) {
+    store.delete(broadcastId);
+    await safeAnswerCallback(ctx, config, {
+      text: "Broadcast confirmation expired",
+      show_alert: true,
+    });
+    if (ctx.callbackQuery?.message) {
+      try {
+        await ctx.editMessageText("⚠️ Broadcast confirmation expired.");
+      } catch {
+        // ignore
+      }
     }
+    return;
+  }
 
-    const text = ctx.message?.text ?? "";
-    const spaceIndex = text.indexOf(" ");
-    const broadcastText = spaceIndex !== -1 ? text.slice(spaceIndex + 1).trim() : "";
-
-    if (!broadcastText) {
-      await ctx.reply("Usage: /broadcast <message text>");
-      return;
+  if (subAction === "cancel") {
+    store.delete(broadcastId);
+    await safeAnswerCallback(ctx, config, { text: "Broadcast cancelled" });
+    if (ctx.callbackQuery?.message) {
+      try {
+        await ctx.editMessageText("❌ Broadcast cancelled.");
+      } catch {
+        // ignore
+      }
     }
+    return;
+  }
 
-    const chatIds = deps.targetChatIds ?? targetChatIds(config);
-    if (chatIds.length === 0) {
-      await ctx.reply("No target chats configured.");
-      return;
+  // subAction === "confirm"
+  // Each chat receives the message at most once per confirmation.
+  if (pending.confirmed) {
+    await safeAnswerCallback(ctx, config, {
+      text: "Broadcast already in progress or sent",
+      show_alert: true,
+    });
+    return;
+  }
+  pending.confirmed = true;
+  store.delete(broadcastId);
+
+  await safeAnswerCallback(ctx, config, { text: "Broadcasting message..." });
+
+  if (ctx.callbackQuery?.message) {
+    try {
+      await ctx.editMessageText(`⏳ Broadcasting to ${pending.chats.length} chat(s)...`);
+    } catch {
+      // ignore
     }
+  }
 
-    const token = newToken();
-    const entry: PendingBroadcast = {
-      token,
-      text: broadcastText,
-      chatIds,
-      operatorChatId: ctx.chat.id,
-    };
-    store.add(entry);
-
-    const preview = Array.from(broadcastText).slice(0, 80).join("");
-    const previewSuffix = Array.from(broadcastText).length > 80 ? "…" : "";
-    const chatCount = chatIds.length;
-    await ctx.reply(
-      `Broadcast to ${chatCount} chat${chatCount === 1 ? "" : "s"}:\n\n"${preview}${previewSuffix}"\n\nConfirm or cancel?`,
-      {
-        reply_markup: confirmKeyboard(token),
-        link_preview_options: { is_disabled: true },
-      },
-    );
+  const interSendDelayMs = config.interSendDelayMs ?? 1500;
+  const results = await sendBroadcast({
+    api: ctx.api,
+    chats: pending.chats,
+    message: pending.message,
+    interSendDelayMs,
+    sleep: deps.sleep,
   });
 
-  // The callback handler is registered separately so bot.ts can use
-  // registerCallbackHandler() to route all callback_query updates through
-  // handleCallbackQuery in one place. Here we export the per-data handler
-  // that registerCallbackHandler calls when the prefix matches.
-  bot.on("callback_query:data", async (ctx) => {
-    const data = ctx.callbackQuery.data ?? "";
-    if (!data.startsWith(BROADCAST_PREFIX)) return;
-
-    if (!isOperatorUser(ctx, config)) {
-      console.warn(
-        `[broadcast] ignored unauthorized callback on update ${ctx.update.update_id}`,
-      );
-      await ctx.answerCallbackQuery({ text: "Not authorised.", show_alert: false }).catch(() => undefined);
+  const report = formatBroadcastReport(results);
+  if (ctx.callbackQuery?.message) {
+    try {
+      await ctx.editMessageText(report);
       return;
+    } catch {
+      // fallback to reply
     }
+  }
+  await ctx.reply(report);
+}
 
-    await handleCallbackQuery(
-      ctx as unknown as CallbackContext,
-      async (_data) => {
-        const parts = data.slice(BROADCAST_PREFIX.length).split(":");
-        const action = parts[0];
-        const token = parts.slice(1).join(":");
-
-        if (action === "confirm") {
-          const entry = store.consume(token);
-          if (!entry) {
-            // Already acted on or token evicted — acknowledge and move on.
-            await ctx.answerCallbackQuery({ text: "Already actioned.", show_alert: false });
-            await ctx.editMessageText("Broadcast already actioned.").catch(() => undefined);
-            return;
-          }
-
-          const send = deps.sendMessage ?? ((chatId, text) => ctx.api.sendMessage(chatId, text));
-          const { sent, failed } = await sendToTargets(entry.text, entry.chatIds, send);
-          const summary =
-            failed === 0
-              ? `Broadcast sent to ${sent} chat${sent === 1 ? "" : "s"}.`
-              : `Broadcast sent to ${sent} chat${sent === 1 ? "" : "s"}, ${failed} failed.`;
-
-          await ctx.answerCallbackQuery({ text: "Sent.", show_alert: false });
-          await ctx.editMessageText(summary);
-        } else if (action === "cancel") {
-          store.consume(token);
-          await ctx.answerCallbackQuery({ text: "Cancelled.", show_alert: false });
-          await ctx.editMessageText("Broadcast cancelled.");
-        } else {
-          // Unknown action — acknowledge without acting.
-          await ctx.answerCallbackQuery({ show_alert: false });
-        }
-      },
-      {
-        deletedToast: "Confirmation message was deleted. No broadcast was sent.",
-        deletedFallbackReply: "The broadcast confirmation message was deleted. No broadcast was sent. Use /broadcast again to retry.",
-      },
-    );
+/**
+ * Register broadcast command handlers on a bot.
+ */
+export function registerBroadcastHandlers(
+  bot: Bot | {
+    command: (name: string, handler: (ctx: CommandContext<Context>) => Promise<void>) => void;
+  },
+  deps: BotDeps & { broadcastStore?: BroadcastStore },
+): void {
+  bot.command("broadcast", async (ctx: CommandContext<Context>) => {
+    await handleBroadcastCommand(ctx, deps);
   });
 }

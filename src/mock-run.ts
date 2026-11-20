@@ -76,6 +76,7 @@ async function main(): Promise<void> {
   console.log(`[dry-run] market    ${config.marketContractId}`);
   console.log(`[dry-run] squad     ${config.squadContractId}`);
   console.log(`[dry-run] cursor    ${config.cursorFile}`);
+  console.log(`[dry-run] locale    ${config.locale}`);
   console.log(
     `[dry-run] poll      every ${config.pollIntervalMs}ms · cap ${config.maxNotificationsPerCycle} notification(s)/cycle`,
   );
@@ -101,6 +102,9 @@ async function main(): Promise<void> {
   };
   process.once("SIGINT", () => shutdown("SIGINT"));
   process.once("SIGTERM", () => shutdown("SIGTERM"));
+  if (process.platform === "win32") {
+    process.once("SIGBREAK", () => shutdown("SIGBREAK"));
+  }
 }
 
 main().catch((err: unknown) => {

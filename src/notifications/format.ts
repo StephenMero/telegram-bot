@@ -8,8 +8,13 @@
  *
  * One event, one message, one line of substance. A notification is read on a
  * phone lock screen.
+ *
+ * Link previews are controlled per message: enabled for events with transaction
+ * links (which provide useful context about on-chain activity) and disabled for
+ * commands and status messages to keep the UI clean.
  */
 
+import { redactText } from "../redact.js";
 import { txExplorerUrl } from "../stellar/client.js";
 import {
   formatUsdc,
@@ -19,7 +24,30 @@ import {
   winnerSideLabel,
   type DecodedEvent,
 } from "../stellar/decode.js";
+import { normalizeCategory } from "../stellar/category.js";
+import { appUrlFor } from "./app-links.js";
+import { iconForCategory } from "./category-icons.js";
+import { groupDigestEvents } from "./digest-grouping.js";
+import { confidenceIndicator } from "./confidence.js";
+import { sanitizeUserText } from "./sanitize.js";
+import { settlementLines } from "./settlement.js";
+import { formatSquadResolution, renderSquadResolution } from "./squad-resolution.js";
 import type { StellarConfig } from "../config.js";
+import { messagesFor, type Messages } from "../i18n.js";
+import { formatDeadline } from "./time.js";
+import {
+  highlightLevel,
+  highlightMarker,
+  prefixFirstLine,
+  type HighlightThresholds,
+} from "./highlights.js";
+export {
+  highlightLevel,
+  highlightMarker,
+  prefixFirstLine,
+  type HighlightLevel,
+  type HighlightThresholds,
+} from "./highlights.js";
 
 /** Telegram's MarkdownV2 reserved set. All of it must be escaped, everywhere. */
 const MDV2_RESERVED = /[_*[\]()~`>#+\-=|{}.!\\]/g;
@@ -28,6 +56,61 @@ const MAX_TX_HASH_LENGTH = 128;
 
 export function escapeMd(text: string): string {
   return text.replace(MDV2_RESERVED, (ch) => `\\${ch}`);
+}
+
+
+/** Telegram Bot API hard limit for sendMessage / editMessageText text. */
+export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
+
+/**
+ * Split a MarkdownV2 (or plain) payload so each chunk fits Telegram's size limit.
+ *
+ * Prefers breaking on newlines, omitting the separator newline from the chunks.
+ * Never splits a UTF-16 surrogate pair or ends a chunk on a lone backslash.
+ * Hard-splits only when a single line exceeds the limit. Throws if the limit
+ * cannot fit a complete code point or MarkdownV2 escape.
+ */
+export function splitTelegramMessage(
+  text: string,
+  limit: number = TELEGRAM_MAX_MESSAGE_LENGTH,
+): string[] {
+  if (!Number.isFinite(limit) || limit < 1) {
+    throw new RangeError(`splitTelegramMessage limit must be >= 1, got ${limit}`);
+  }
+  if (text.length <= limit) return [text];
+
+  const parts: string[] = [];
+  let remaining = text;
+
+  function safeCut(cut: number): number {
+    const before = remaining.charCodeAt(cut - 1);
+    const after = remaining.charCodeAt(cut);
+    if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) {
+      cut -= 1;
+    }
+    // Retreating before an emoji can expose an escape prefix as well.
+    let start = cut;
+    while (start > 0 && remaining[start - 1] === "\\") start -= 1;
+    return cut - ((cut - start) % 2);
+  }
+
+  while (remaining.length > limit) {
+    let cut = remaining.lastIndexOf("\n", limit);
+    if (cut <= 0) cut = Math.floor(limit);
+    cut = safeCut(cut);
+    // An unsafe newline near the start may still allow a safe hard split.
+    if (cut <= 0) cut = safeCut(Math.floor(limit));
+    if (cut <= 0) {
+      throw new RangeError(`splitTelegramMessage limit ${limit} cannot fit a code point or escape`);
+    }
+
+    parts.push(remaining.slice(0, cut));
+    remaining = remaining.slice(cut);
+    if (remaining.startsWith("\n")) remaining = remaining.slice(1);
+  }
+
+  if (remaining.length > 0) parts.push(remaining);
+  return parts;
 }
 
 /**
@@ -59,20 +142,61 @@ function describeError(error: unknown): string {
 }
 
 /**
+ * Telegram send timeout budget, in milliseconds.
+ *
+ * Individual sends are bounded so a single stalled request cannot wedge the
+ * poller: the cursor must advance (or the batch must be retried) on a
+ * predictable schedule, not on Telegram's liveness. Kept here, next to the
+ * error formatting, so the poller and its tests share one source of truth.
+ */
+export const TELEGRAM_SEND_TIMEOUT_MS = 10_000;
+
+/**
+ * True when a thrown value looks like a timeout/abort rather than a Telegram
+ * API rejection. Recognises `AbortError`, `TimeoutError`, and the common
+ * `ETIMEDOUT`/`ECONNRESET`/`UND_ERR_*` shapes surfaced by fetch/undici, so the
+ * poller can log "timed out" instead of a generic failure and retry the batch.
+ */
+export function isTimeoutError(error: unknown): boolean {
+  if (error instanceof Error) {
+    if (error.name === "AbortError" || error.name === "TimeoutError") return true;
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === "string" && /^(ETIMEDOUT|ECONNRESET|UND_ERR_)/.test(code)) {
+      return true;
+    }
+    return /timed? ?out/i.test(error.message);
+  }
+  if (error !== null && typeof error === "object") {
+    const record = error as { name?: unknown; code?: unknown; message?: unknown };
+    if (record.name === "AbortError" || record.name === "TimeoutError") return true;
+    if (typeof record.code === "string" && /^(ETIMEDOUT|ECONNRESET|UND_ERR_)/.test(record.code)) {
+      return true;
+    }
+    if (typeof record.message === "string" && /timed? ?out/i.test(record.message)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Keep operational errors actionable without copying remote payloads or the
  * bot token into logs and status messages.
  */
 export function safeErrorMessage(error: unknown, secrets: readonly string[] = []): string {
-  let message = describeError(error);
-  for (const secret of secrets) {
-    if (secret) message = message.split(secret).join("[REDACTED]");
-  }
+  // Collapse first, so the bound below is applied to the text that will
+  // actually be shown rather than to remote whitespace.
+  const collapsed = describeError(error).replace(/\s+/g, " ").trim();
 
-  // Also cover a Telegram token embedded in an upstream error when the
-  // caller does not have the configured value (for example in a unit test).
-  message = message.replace(/\b\d{6,12}:[A-Za-z0-9_-]{20,}\b/g, "[REDACTED]");
+  // Caller-supplied secrets, the secrets registered at boot, and the
+  // credential shapes in `redact.ts`: the same rules the audit trail
+  // applies, so an error cannot carry a seed strkey, a token, or a URL's
+  // credentials into a log, `/status`, or `/health`.
+  const message = redactText(collapsed, { secrets });
 
-  const compact = message.replace(/\s+/g, " ").trim() || "unknown error";
+  // A timeout is labelled explicitly so operators can tell a stalled Telegram
+  // send from an API rejection without parsing the raw error text.
+  const compact = message.trim() || (isTimeoutError(error) ? "send timed out" : "unknown error");
   return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
 }
 
@@ -84,8 +208,15 @@ function who(address: string): string {
   return `\`${escapeMd(shortAddress(address))}\``;
 }
 
-/** Truncate an unbounded contract String without splitting a Unicode code point. */
-function clip(text: string, max = MAX_EVENT_FIELD_LENGTH): string {
+/**
+ * Truncate an unbounded contract String before it sizes a chat message.
+ *
+ * The category, question, and summary fields all come from remote contract
+ * state. A hard cap here means a crafted payload cannot push an unbounded
+ * string through to a Telegram message or to a log line. Never splits a
+ * Unicode code point.
+ */
+export function clip(text: string, max = MAX_EVENT_FIELD_LENGTH): string {
   const trimmed = text.trim();
   const characters = Array.from(trimmed);
   return characters.length <= max ? trimmed : `${characters.slice(0, max - 1).join("")}…`;
@@ -134,21 +265,119 @@ export interface ExplorerKeyboard {
 }
 
 /**
+ * Config the keyboard builder reads: the chain fields `eventExplorerUrl`
+ * needs, plus the optional Mimir web-app origin (`MIMIR_APP_URL`) that adds a
+ * second button. Optional here so a chain-only config keeps building the
+ * explorer-only keyboard it has always built.
+ */
+export type KeyboardConfig = StellarConfig & { mimirAppUrl?: string | null };
+
+/**
  * Telegram inline keyboard for an event notification.
  *
- * Returns undefined when the event carries no usable transaction hash, so the
- * caller sends the existing text-only message unchanged. The button reuses the
- * same canonical explorer URL as the `· [tx](…)` footer link — the footer stays
- * as the text fallback, the button is progressive enhancement in the same
- * Telegram request (no second message, no extra rate-limit cost).
+ * Returns undefined when the event carries no usable transaction hash and no
+ * Mimir app page, so the caller sends the existing text-only message
+ * unchanged. The explorer button reuses the same canonical explorer URL as the
+ * `· [tx](…)` footer link — the footer stays as the text fallback, the button
+ * is progressive enhancement in the same Telegram request (no second message,
+ * no extra rate-limit cost). When `config.mimirAppUrl` is set and the event
+ * maps to an app page, the "Open in Mimir" button joins the same row.
  */
 export function explorerKeyboard(
-  config: StellarConfig,
+  config: KeyboardConfig,
   event: DecodedEvent,
 ): ExplorerKeyboard | undefined {
-  const url = eventExplorerUrl(config, event);
-  if (!url) return undefined;
-  return { inline_keyboard: [[{ text: "View on Explorer", url }]] };
+  const messages = messagesFor(config.locale);
+  const buttons: ExplorerButton[] = [];
+  const explorerUrl = eventExplorerUrl(config, event);
+  if (explorerUrl) buttons.push({ text: messages.explorerButtonText, url: explorerUrl });
+
+  const appUrl = appUrlFor(event, config.mimirAppUrl);
+  if (appUrl) buttons.push({ text: messages.mimirAppButtonText, url: appUrl });
+
+  if (buttons.length === 0) return undefined;
+  return { inline_keyboard: [buttons] };
+}
+
+/** Format the latest observed event, including events with no notification template. */
+export function formatLastEvent(
+  config: StellarConfig & { nowMs?: number },
+  event: DecodedEvent,
+  nowMs?: number,
+): string {
+  const notification = formatEvent(config, event, nowMs);
+  if (notification !== null) return notification;
+
+  const name = event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
+  return (
+    `*Last observed event* — \`${escapeMd(clip(name, 120))}\`\n` +
+    `This event has no notification summary\.\n${footer(config, event)}`
+  );
+}
+
+/** Options for {@link formatDigest}. */
+export interface FormatDigestOptions {
+  /**
+   * When `true`, events are grouped by claim / squad market before rendering.
+   * Multi-event groups get an escaped Group_Key header and indented sub-lines;
+   * singletons are rendered exactly like the flat layout.
+   *
+   * Defaults to `false` — the existing flat layout is unchanged when this
+   * option is omitted or set to `false`.
+   */
+  grouped?: boolean;
+}
+
+/**
+ * One digest line in the flat layout.  Extracted so both the flat path and the
+ * grouped renderer share identical line formatting.
+ */
+function flatLine(event: DecodedEvent): string {
+  const name = event.payload.name === "unknown" ? event.payload.eventName : event.payload.name;
+  return `· mimir\\-${escapeMd(event.source)} \`${escapeMd(clip(name, 80))}\` at ledger ${event.ledger}`;
+}
+
+/**
+ * Render a grouped digest.  Called only when `options.grouped` is `true`.
+ */
+function renderGroupedDigest(events: readonly DecodedEvent[]): string {
+  const groups = groupDigestEvents(events);
+  const header = `*Mimir Digest* — ${events.length} events in this cycle`;
+  const body: string[] = [];
+
+  for (const group of groups) {
+    if (group.events.length === 1) {
+      // Singleton group: no header, no indentation — identical to flat layout.
+      const [sole] = group.events;
+      if (sole) body.push(flatLine(sole));
+    } else {
+      // Multi-event group: MarkdownV2-escaped Group_Key as header, then
+      // each event on an indented line.
+      body.push(escapeMd(group.key));
+      for (const e of group.events) {
+        body.push(`  ${flatLine(e)}`);
+      }
+    }
+  }
+
+  return [header, "", ...body].join("\n");
+}
+
+/**
+ * One MarkdownV2 message summarising a burst of events: a header with the count
+ * and one bounded line per event. Returns null when there is nothing to send.
+ *
+ * Pass `{ grouped: true }` to group consecutive events by claim / squad market.
+ * The default (`{}` or no second argument) produces the unchanged flat layout.
+ */
+export function formatDigest(
+  events: readonly DecodedEvent[],
+  options: FormatDigestOptions = {},
+): string | null {
+  if (events.length === 0) return null;
+  if (options.grouped) return renderGroupedDigest(events);
+  const lines = events.map(flatLine);
+  return [`*Mimir Digest* — ${events.length} events in this cycle`, "", ...lines].join("\n");
 }
 
 /**
@@ -159,93 +388,116 @@ export function explorerKeyboard(
  * in contract state, not the event, so it is not invented here. The squad
  * contract's `market_created` does carry `question`, and that is shown.
  */
-function headline(event: DecodedEvent): string | null {
+function headline(
+  messages: Messages,
+  event: DecodedEvent,
+  nowMs?: number,
+): string | null {
   const p = event.payload;
+  const md = messages.notificationMd;
 
   switch (p.name) {
     // ── mimir-market ────────────────────────────────────────────────────────
-    case "claim_created":
-      return (
-        `🆕 *New claim* \\#${p.claimId}\n` +
-        `Category: ${escapeMd(clip(p.category))}\n` +
-        `Creator: ${who(p.creator)}`
+    case "claim_created": {
+      const icon = iconForCategory(p.category);
+      const cat = escapeMd(clip(sanitizeUserText(p.category)));
+      const formattedCategory = cat ? `${icon} ${cat}` : icon;
+      return md.claimCreated(
+        String(p.claimId),
+        formattedCategory,
+        who(p.creator),
       );
+    }
 
     case "claim_challenged":
-      return (
-        `⚔️ *Claim \\#${p.claimId} challenged*\n` +
-        `Stake: *${usdc(p.stake)}*\n` +
-        `Challenger: ${who(p.challenger)}`
+      return md.claimChallenged(
+        String(p.claimId),
+        usdc(p.stake),
+        who(p.challenger),
       );
 
     case "claim_resolved":
-      return (
-        `⚖️ *Claim \\#${p.claimId} resolved* — winner: *${escapeMd(winnerSideLabel(p.winnerSide))}*\n` +
-        `Confidence: ${escapeMd(String(p.confidence))}%\n` +
-        (p.summary ? `_${escapeMd(clip(p.summary))}_` : "")
-      ).trimEnd();
-
-    case "claim_cancelled":
-      return `🚫 *Claim \\#${p.claimId} cancelled* — stakes returned`;
-
-    case "market_settled":
-      return (
-        `💰 *Claim \\#${p.claimId} settled*\n` +
-        `Paid out: *${usdc(p.totalPaid)}* · fees ${usdc(p.totalFees)}\n` +
-        `Owed to challengers: ${usdc(p.owedToChallengers)}`
+      return md.claimResolved(
+        String(p.claimId),
+        escapeMd(winnerSideLabel(p.winnerSide)),
+        escapeMd(confidenceIndicator(p.confidence)),
+        p.summary ? escapeMd(clip(sanitizeUserText(p.summary))) : null,
       );
 
+    case "claim_cancelled":
+      return md.claimCancelled(String(p.claimId));
+
+    case "market_settled": {
+      const lines = settlementLines(p).map(escapeMd);
+      return md.marketSettled(
+        String(p.claimId),
+        usdc(p.totalPaid),
+        usdc(p.totalFees),
+        usdc(p.owedToChallengers),
+        lines,
+      );
+    }
+
     case "challenger_paid":
-      return (
-        `🏆 *Challenger paid* on claim \\#${p.claimId}\n` +
-        `${who(p.challenger)} staked ${usdc(p.stake)} → net *${usdc(p.net)}*\n` +
-        `Gross ${usdc(p.gross)} · fee ${usdc(p.fee)}`
+      return md.challengerPaid(
+        String(p.claimId),
+        who(p.challenger),
+        usdc(p.stake),
+        usdc(p.net),
+        usdc(p.gross),
+        usdc(p.fee),
       );
 
     case "fee_claimed":
-      return `🧾 *Fees claimed* — ${usdc(p.amount)} to ${who(p.recipient)}`;
+      return md.feeClaimed(usdc(p.amount), who(p.recipient));
 
     case "withdrawal":
-      return `📤 *Withdrawal* — ${usdc(p.amount)} to ${who(p.to)}`;
+      return md.withdrawal(usdc(p.amount), who(p.to));
 
     case "withdrawal_pending":
-      return `⏳ *Withdrawal parked* — ${usdc(p.amount)} claimable by ${who(p.to)}`;
+      return md.withdrawalPending(usdc(p.amount), who(p.to));
 
     // ── mimir-squad ─────────────────────────────────────────────────────────
     case "market_created":
-      return (
-        `🆕 *New squad market* \\#${p.marketId}\n` +
-        `${escapeMd(clip(p.question))}\n` +
-        `Captain: ${who(p.captain)} · fee ${escapeMd(String(p.feeBps))} bps · ` +
-        `deadline ${escapeMd(new Date(p.deadline * 1000).toISOString())}`
+      return md.marketCreated(
+        String(p.marketId),
+        escapeMd(clip(sanitizeUserText(p.question))),
+        who(p.captain),
+        escapeMd(String(p.feeBps)),
+        escapeMd(formatDeadline(p.deadline, nowMs)),
+        p.category ? escapeMd(clip(p.category)) : null,
       );
 
     case "deposited":
-      return (
-        `➕ *Squad \\#${p.marketId}* — ${usdc(p.amount)} on *${escapeMd(squadSideLabel(p.side))}*\n` +
-        `Participant: ${who(p.participant)}`
+      return md.deposited(
+        String(p.marketId),
+        usdc(p.amount),
+        escapeMd(squadSideLabel(p.side)),
+        who(p.participant),
       );
 
     case "withdrawn":
-      return (
-        `➖ *Squad \\#${p.marketId}* — ${who(p.participant)} pulled ${usdc(p.amount)} ` +
-        `from ${escapeMd(squadSideLabel(p.side))}`
+      return md.withdrawn(
+        String(p.marketId),
+        who(p.participant),
+        usdc(p.amount),
+        escapeMd(squadSideLabel(p.side)),
       );
 
     case "resolved":
-      return (
-        `🏁 *Squad \\#${p.marketId} resolved* — *${escapeMd(squadSideLabel(p.result))}*\n` +
-        `Pools: A ${usdc(p.poolA)} · B ${usdc(p.poolB)}`
-      );
+      return renderSquadResolution(formatSquadResolution(p), md, escapeMd);
 
     case "claimed":
-      return (
-        `💸 *Squad payout* on \\#${p.marketId}\n` +
-        `${who(p.participant)} → net *${usdc(p.net)}* \\(gross ${usdc(p.gross)}, fee ${usdc(p.fee)}\\)`
+      return md.claimed(
+        String(p.marketId),
+        who(p.participant),
+        usdc(p.net),
+        usdc(p.gross),
+        usdc(p.fee),
       );
 
     case "fees_claimed":
-      return `🧾 *Squad fees claimed* — ${usdc(p.amount)} to ${who(p.recipient)}`;
+      return md.feesClaimedSquad(usdc(p.amount), who(p.recipient));
 
     // Admin events and undecodable shapes get no notification. The poller logs
     // them so a silent bot is distinguishable from an unteachable one.
@@ -267,16 +519,58 @@ function headline(event: DecodedEvent): string | null {
 }
 
 /** The full message, or null when the event is not worth notifying. */
-export function formatEvent(
-  config: StellarConfig & { channelPreviewMode?: boolean },
+/**
+ * True unless NOTIFY_CATEGORIES is set and this is a `claim_created` event whose
+ * category is not on the allowlist. Every other notification type always passes.
+ *
+ * Both sides of the comparison are normalised with {@link normalizeCategory}:
+ * NFKC, trimmed, lowercased, inner whitespace collapsed, control characters
+ * stripped, and bounded in length. This makes the filter robust to the
+ * free-form on-chain strings (`Crypto`, ` crypto`, full-width variants) that
+ * would otherwise silently fail to match a configured category name.
+ */
+export function eventAllowedByCategory(
+  config: { notificationCategories?: readonly string[] },
   event: DecodedEvent,
+): boolean {
+  const categories = config.notificationCategories ?? [];
+  if (categories.length === 0 || event.payload.name !== "claim_created") return true;
+  const allowed = new Set(categories.map((category) => normalizeCategory(category)));
+  return allowed.has(normalizeCategory(String(event.payload.category ?? "")));
+}
+
+export function formatEvent(
+  config: StellarConfig & {
+    channelPreviewMode?: boolean;
+    notificationCategories?: readonly string[];
+    highlightThresholds?: HighlightThresholds;
+    nowMs?: number;
+  },
+  event: DecodedEvent,
+  nowMsOrThresholds?: number | HighlightThresholds,
 ): string | null {
+  if (!eventAllowedByCategory(config, event)) return null;
+  const nowMs = typeof nowMsOrThresholds === "number" ? nowMsOrThresholds : undefined;
+  const thresholds =
+    typeof nowMsOrThresholds === "object" && nowMsOrThresholds !== null
+      ? nowMsOrThresholds
+      : undefined;
+  const currentMs = nowMs ?? config.nowMs ?? (event?.at && event.at > 0 ? event.at * 1000 : Date.now());
   try {
-    const head = headline(event);
+    const messages = messagesFor(config.locale);
+    let head = headline(messages, event, currentMs);
     if (head === null) return null;
+    const effectiveThresholds = thresholds ?? config.highlightThresholds;
+    if (effectiveThresholds !== undefined) {
+      const level = highlightLevel(event, effectiveThresholds);
+      const marker = highlightMarker(level, effectiveThresholds);
+      if (marker) {
+        head = prefixFirstLine(head, marker);
+      }
+    }
     const body = `${head}\n${footer(config, event)}`;
     if (config.channelPreviewMode) {
-      return `🧪 *[PREVIEW MODE]*\n${body}`;
+      return `${messages.notificationMd.previewModePrefix}\n${body}`;
     }
     return body;
   } catch (err) {
@@ -310,94 +604,112 @@ function plainFooter(config: StellarConfig, event: DecodedEvent): string {
  * field-for-field (same identities, amounts, bounded clips) but emits no
  * MarkdownV2 syntax at all, so Telegram cannot reject it for entity parsing.
  */
-function plainHeadline(event: DecodedEvent): string | null {
+function plainHeadline(
+  messages: Messages,
+  event: DecodedEvent,
+  nowMs?: number,
+): string | null {
   const p = event.payload;
+  const plain = messages.notificationPlain;
 
   switch (p.name) {
     // ── mimir-market ────────────────────────────────────────────────────────
-    case "claim_created":
-      return (
-        `New claim #${p.claimId}\n` +
-        `Category: ${clip(p.category)}\n` +
-        `Creator: ${plainWho(p.creator)}`
-      );
+    case "claim_created": {
+      const icon = iconForCategory(p.category);
+      const cat = clip(sanitizeUserText(p.category));
+      const formattedCategory = cat ? `${icon} ${cat}` : icon;
+      return plain.claimCreated(p.claimId, formattedCategory, plainWho(p.creator));
+    }
 
     case "claim_challenged":
-      return (
-        `Claim #${p.claimId} challenged\n` +
-        `Stake: ${plainUsdc(p.stake)}\n` +
-        `Challenger: ${plainWho(p.challenger)}`
+      return plain.claimChallenged(
+        p.claimId,
+        plainUsdc(p.stake),
+        plainWho(p.challenger),
       );
 
     case "claim_resolved":
-      return (
-        `Claim #${p.claimId} resolved — winner: ${winnerSideLabel(p.winnerSide)}\n` +
-        `Confidence: ${String(p.confidence)}%` +
-        (p.summary ? `\n${clip(p.summary)}` : "")
+      return plain.claimResolved(
+        p.claimId,
+        winnerSideLabel(p.winnerSide),
+        confidenceIndicator(p.confidence),
+        p.summary ? clip(sanitizeUserText(p.summary)) : null,
       );
 
     case "claim_cancelled":
-      return `Claim #${p.claimId} cancelled — stakes returned`;
+      return plain.claimCancelled(p.claimId);
 
-    case "market_settled":
-      return (
-        `Claim #${p.claimId} settled\n` +
-        `Paid out: ${plainUsdc(p.totalPaid)} · fees ${plainUsdc(p.totalFees)}\n` +
-        `Owed to challengers: ${plainUsdc(p.owedToChallengers)}`
+    case "market_settled": {
+      const lines = settlementLines(p);
+      return plain.marketSettled(
+        p.claimId,
+        plainUsdc(p.totalPaid),
+        plainUsdc(p.totalFees),
+        plainUsdc(p.owedToChallengers),
+        lines,
       );
+    }
 
     case "challenger_paid":
-      return (
-        `Challenger paid on claim #${p.claimId}\n` +
-        `${plainWho(p.challenger)} staked ${plainUsdc(p.stake)} → net ${plainUsdc(p.net)}\n` +
-        `Gross ${plainUsdc(p.gross)} · fee ${plainUsdc(p.fee)}`
+      return plain.challengerPaid(
+        p.claimId,
+        plainWho(p.challenger),
+        plainUsdc(p.stake),
+        plainUsdc(p.net),
+        plainUsdc(p.gross),
+        plainUsdc(p.fee),
       );
 
     case "fee_claimed":
-      return `Fees claimed — ${plainUsdc(p.amount)} to ${plainWho(p.recipient)}`;
+      return plain.feeClaimed(plainUsdc(p.amount), plainWho(p.recipient));
 
     case "withdrawal":
-      return `Withdrawal — ${plainUsdc(p.amount)} to ${plainWho(p.to)}`;
+      return plain.withdrawal(plainUsdc(p.amount), plainWho(p.to));
 
     case "withdrawal_pending":
-      return `Withdrawal parked — ${plainUsdc(p.amount)} claimable by ${plainWho(p.to)}`;
+      return plain.withdrawalPending(plainUsdc(p.amount), plainWho(p.to));
 
     // ── mimir-squad ─────────────────────────────────────────────────────────
     case "market_created":
-      return (
-        `New squad market #${p.marketId}\n` +
-        `${clip(p.question)}\n` +
-        `Captain: ${plainWho(p.captain)} · fee ${String(p.feeBps)} bps · ` +
-        `deadline ${new Date(p.deadline * 1000).toISOString()}`
+      return plain.marketCreated(
+        p.marketId,
+        clip(sanitizeUserText(p.question)),
+        plainWho(p.captain),
+        String(p.feeBps),
+        formatDeadline(p.deadline, nowMs),
+        p.category ? clip(p.category) : null,
       );
 
     case "deposited":
-      return (
-        `Squad #${p.marketId} — ${plainUsdc(p.amount)} on ${squadSideLabel(p.side)}\n` +
-        `Participant: ${plainWho(p.participant)}`
+      return plain.deposited(
+        p.marketId,
+        plainUsdc(p.amount),
+        squadSideLabel(p.side),
+        plainWho(p.participant),
       );
 
     case "withdrawn":
-      return (
-        `Squad #${p.marketId} — ${plainWho(p.participant)} pulled ${plainUsdc(p.amount)} ` +
-        `from ${squadSideLabel(p.side)}`
+      return plain.withdrawn(
+        p.marketId,
+        plainWho(p.participant),
+        plainUsdc(p.amount),
+        squadSideLabel(p.side),
       );
 
     case "resolved":
-      return (
-        `Squad #${p.marketId} resolved — ${squadSideLabel(p.result)}\n` +
-        `Pools: A ${plainUsdc(p.poolA)} · B ${plainUsdc(p.poolB)}`
-      );
+      return renderSquadResolution(formatSquadResolution(p), plain);
 
     case "claimed":
-      return (
-        `Squad payout on #${p.marketId}\n` +
-        `${plainWho(p.participant)} → net ${plainUsdc(p.net)} ` +
-        `(gross ${plainUsdc(p.gross)}, fee ${plainUsdc(p.fee)})`
+      return plain.claimed(
+        p.marketId,
+        plainWho(p.participant),
+        plainUsdc(p.net),
+        plainUsdc(p.gross),
+        plainUsdc(p.fee),
       );
 
     case "fees_claimed":
-      return `Squad fees claimed — ${plainUsdc(p.amount)} to ${plainWho(p.recipient)}`;
+      return plain.feesClaimedSquad(plainUsdc(p.amount), plainWho(p.recipient));
 
     // Same set as `headline`: admin events and undecodable shapes get nothing.
     case "oracle_changed":
@@ -435,29 +747,45 @@ function clipPlainText(text: string, max = MAX_PLAIN_TEXT_LENGTH): string {
  * a minimal bounded line rather than crashing the notifier.
  */
 export function formatPlainTextEvent(
-  config: StellarConfig,
+  config: StellarConfig & { highlightThresholds?: HighlightThresholds; nowMs?: number },
   event: DecodedEvent,
+  nowMsOrThresholds?: number | HighlightThresholds,
 ): string | null {
+  const messages = messagesFor(config.locale);
+  const nowMs = typeof nowMsOrThresholds === "number" ? nowMsOrThresholds : undefined;
+  const thresholds =
+    typeof nowMsOrThresholds === "object" && nowMsOrThresholds !== null
+      ? nowMsOrThresholds
+      : undefined;
+  const currentMs = nowMs ?? config.nowMs ?? (event?.at && event.at > 0 ? event.at * 1000 : Date.now());
   try {
-    const head = plainHeadline(event);
+    let head = plainHeadline(messages, event, currentMs);
     if (head === null) return null;
+    const effectiveThresholds = thresholds ?? config.highlightThresholds;
+    if (effectiveThresholds !== undefined) {
+      const level = highlightLevel(event, effectiveThresholds);
+      const marker = highlightMarker(level, effectiveThresholds);
+      if (marker) {
+        head = prefixFirstLine(head, marker);
+      }
+    }
     const body = `${head}\n${plainFooter(config, event)}`.trim();
-    if (!body) return minimalPlainTextEvent(event);
+    if (!body) return minimalPlainTextEvent(messages, event);
     return clipPlainText(body);
   } catch {
-    return minimalPlainTextEvent(event);
+    return minimalPlainTextEvent(messages, event);
   }
 }
 
 /** Last-resort bounded line when even the plain-text formatter cannot render. */
-function minimalPlainTextEvent(event: DecodedEvent): string {
+function minimalPlainTextEvent(messages: Messages, event: DecodedEvent): string {
   const source = typeof event?.source === "string" ? event.source : "unknown";
   const ledger =
     typeof event?.ledger === "number" && Number.isFinite(event.ledger)
       ? `ledger ${event.ledger}`
       : "ledger unknown";
-  const eventId = typeof event?.eventId === "string" && event.eventId ? ` (${event.eventId})` : "";
-  return clipPlainText(`Mimir event (${source}) — ${ledger}${eventId}`);
+  const eventId = typeof event?.eventId === "string" && event.eventId ? event.eventId : "";
+  return clipPlainText(messages.notificationPlain.minimal(source, ledger, eventId));
 }
 
 /**
@@ -473,23 +801,33 @@ export function formatFallbackEvent(
   const ledger = escapeMd(String(event.ledger ?? "unknown"));
   const safeReason = escapeMd(safeErrorMessage(reason));
   const txPart = event.txHash ? ` · [tx](${txExplorerUrl(config, event.txHash)})` : "";
-  return (
-    `⚠️ *Event Notification Fallback* \\(${source}\\)\n` +
-    `Contract: \`${contract}\` · Ledger: ${ledger}${txPart}\n` +
-    `Reason: _${safeReason}_`
+  return messagesFor(config.locale).notificationMd.fallbackEvent(
+    source,
+    contract,
+    ledger,
+    safeReason,
+    txPart,
   );
 }
 
 /**
  * Generate a channel preview message for on-demand preview commands.
+ * Shows a sample notification and current link preview settings for the specified contract.
  */
-export function previewMessage(config: StellarConfig, target = "market"): string {
+export function previewMessage(config: StellarConfig & { linkPreviewMarket?: boolean; linkPreviewSquad?: boolean }, target = "market"): string {
+  const messages = messagesFor(config.locale);
   const isSquad = target.trim().toLowerCase() === "squad";
+  const linkPreviewEnabled = isSquad
+    ? config.linkPreviewSquad ?? false
+    : config.linkPreviewMarket ?? false;
+
+  const settingsLine = `Link previews: ${linkPreviewEnabled ? "enabled" : "disabled"}`;
 
   if (isSquad) {
     const sampleEvent: DecodedEvent = {
       source: "squad",
       contractId: config.squadContractId,
+      version: "v1",
       ledger: 1000000,
       txHash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
       at: Math.floor(Date.now() / 1000),
@@ -508,12 +846,13 @@ export function previewMessage(config: StellarConfig, target = "market"): string
       },
     };
     const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
-    return `🧪 *Channel Preview — mimir\\-squad*\n\n${formatted}`;
+    return `${messages.notificationMd.channelPreviewSquad}\n${settingsLine}\n\n${formatted}`;
   }
 
   const sampleEvent: DecodedEvent = {
     source: "market",
     contractId: config.marketContractId,
+    version: "v1",
     ledger: 1000000,
     txHash: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
     at: Math.floor(Date.now() / 1000),
@@ -530,6 +869,5 @@ export function previewMessage(config: StellarConfig, target = "market"): string
     },
   };
   const formatted = formatEvent({ ...config, channelPreviewMode: false }, sampleEvent) ?? "";
-  return `🧪 *Channel Preview — mimir\\-market*\n\n${formatted}`;
+  return `${messages.notificationMd.channelPreviewMarket}\n${settingsLine}\n\n${formatted}`;
 }
-

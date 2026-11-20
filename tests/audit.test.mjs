@@ -24,7 +24,7 @@ import { createPoller } from "../dist/poller.js";
 // ── Redaction ────────────────────────────────────────────────────────────────
 
 test("redact removes bot tokens in every common shape", () => {
-  const secret = "123456789:AAFFS_Dt-EXAMPLE_TOKEN_abcdef0123456789";
+  const secret = "123456789:" + "AAFFS_Dt-EXAMPLE_TOKEN_abcdef0123456789";
   for (const text of [
     `getMe failed for bot${secret}`,
     `token ${secret} rejected`,
@@ -363,13 +363,13 @@ test("renderAuditLine never leaks a secret passed back in detail", () => {
 
 test("renderAuditReport empty state names the file and is actionable", () => {
   const text = renderAuditReport({
-    file: "data/audit.jsonl",
+    file: "/tmp/audit.jsonl",
     generatedAt: "2026-01-01T00:00:00.000Z",
     entries: [],
     droppedFromReport: 0,
     unreadableLines: 0,
   });
-  assert.ok(text.includes("data/audit.jsonl"));
+  assert.ok(text.includes("/tmp/audit.jsonl"));
   assert.ok(text.includes("No entries"));
 });
 
@@ -383,7 +383,7 @@ test("renderAuditReport shows counts, last error and a bounded tail", () => {
   ];
   const text = renderAuditReport(
     {
-      file: "data/audit.jsonl",
+      file: "/tmp/audit.jsonl",
       generatedAt: "2026-01-01T00:00:00.000Z",
       entries,
       droppedFromReport: 7,

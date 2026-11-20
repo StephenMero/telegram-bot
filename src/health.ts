@@ -8,17 +8,29 @@
  * to publish is where it came from.
  */
 
+import crypto from "node:crypto";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 
+import {
+  emptyActivityBaseline,
+  type ActivityBaselineSnapshot,
+} from "./activity-baseline.js";
 import { configProvenance, networkLabel, type BotConfig, type ConfigProvenance } from "./config.js";
+import type { LogCapture } from "./logger.js";
+import { safeErrorMessage } from "./notifications/format.js";
 import type { PollerStatus } from "./poller.js";
+import { redactText } from "./redact.js";
 
 export interface HealthDeps {
   config: BotConfig;
   status: () => PollerStatus;
+  /** Bounded redacted log ring; when absent or disabled, /health/diag 404s. */
+  logs?: LogCapture;
   /** Optional clock for deterministic tests. */
   now?: () => number;
+  /** Optional handler for Telegram webhook mode (POST /telegram-webhook). */
+  webhookHandler?: ((req: http.IncomingMessage, res: http.ServerResponse) => void) | undefined;
   /**
    * Optional provenance reader for deterministic tests. Defaults to
    * {@link configProvenance}; either way only key names and origins are served.
@@ -39,6 +51,8 @@ export interface HealthReport {
   ok: boolean;
   status: "ok" | "degraded" | "stopped";
   service: "mimir-telegram-bot";
+  /** Semver string from `package.json`, or `"unknown"` if unavailable. */
+  version: string;
   network: string;
   uptimeMs: number;
   checkedAt: string;
@@ -50,6 +64,8 @@ export interface HealthReport {
     stopping: boolean;
     channelPreviewMode: boolean;
     cycles: number;
+    /** Correlation ID for the most recently started poll cycle. */
+    lastCorrelationId: string | null;
     lastPollAt: string | null;
     lastSuccessAt: string | null;
     latestLedger: number | null;
@@ -68,11 +84,38 @@ export interface HealthReport {
     eventsSkipped: number;
     /** Events suppressed as already-seen across overlapping pages / resumes. */
     eventsDeduplicated: number;
+    /**
+     * Rolling comparison of the latest complete cycle's event count with the
+     * recent baseline. A spike is not a fault by itself; it is context for the
+     * counters and the per-cycle log lines.
+     */
+    activity: ActivityBaselineSnapshot;
     notificationsDropped: number;
     /** Cursors automatically rewound to the RPC's retained floor this run. */
     cursorRewinds: number;
+    /**
+     * Bounded queue of sends that exhausted their retries and are waiting to
+     * be replayed. Counts only: no message text, no destination.
+     */
+    deadLetter: { depth: number; enqueued: number; replayed: number; dropped: number };
     consecutiveFailures: number;
+    /** Repetitive error lines summarized rather than printed since start. */
+    suppressedLogs: number;
     lastError: { at: string; message: string } | null;
+    /** Restart gaps detected since this process started. */
+    restartGaps: number;
+    /**
+     * The most recent resume position that fell below the RPC's retained
+     * window. The events it skipped are unrecoverable; this is what made them
+     * visible. Ledger numbers only — never a token or a remote payload.
+     */
+    lastRestartGap: {
+      at: string;
+      source: string;
+      cursorLedger: number;
+      oldestLedger: number;
+      missedLedgers: number;
+    } | null;
     /**
      * In-memory cursor state that is not on disk yet. False after a successful
      * flush, which is what a shutdown is for.
@@ -81,15 +124,34 @@ export interface HealthReport {
     lastFlushAt: string | null;
     targets: Array<{
       source: string;
+      version: string;
       /** Public contract id (on-chain). */
       contractId: string;
+      /** Duration of this target's most recent attempted cycle. */
+      lastCycleMs: number;
+      /** Longest attempted cycle for this target since process start. */
+      maxCycleMs: number;
       lastEventLedger: number | null;
       /** Opaque resume cursor; not a secret. Truncated for readability. */
       cursorPreview: string | null;
+      /** Ledgers lost to the retained window at this target's last restart gap. */
+      gapLedgers: number;
+      /** When this target's stale cursor was last rewound, or null. */
+      cursorResetAt: string | null;
+      /** A cursor is persisted but no ledger can be read out of it. */
+      cursorUnreadable: boolean;
       /** Ledger a target is resuming from after a floor rewind, or null. */
       rewindFromLedger: number | null;
+      /** RPC rejected this target's cursor as stale; true until a scan succeeds. */
+      cursorStale: boolean;
+      /** Successful cycles with an unchanged cursor while behind the tip. */
+      cyclesWithoutAdvance: number;
+      /** Cursor unchanged for {@link CURSOR_STALL_CYCLES} cycles while behind tip. */
+      cursorStalled: boolean;
       hasError: boolean;
     }>;
+    persistentVolumeAvailable: boolean;
+    persistentVolumeError: string | null;
   };
   /**
    * Where configuration came from: each setting's name and the source that
@@ -102,8 +164,46 @@ export interface HealthReport {
 
 const CURSOR_PREVIEW_LEN = 24;
 
+/**
+ * Maximum UTF-8 byte length of an Authorization header accepted by the health
+ * server, including the `Bearer ` scheme prefix. Longer values are malformed.
+ */
+export const MAX_AUTH_HEADER_BYTES = 4096;
+
 function iso(ms: number | null): string | null {
   return ms === null ? null : new Date(ms).toISOString();
+}
+
+/**
+ * Constant-time comparison for bearer token authentication.
+ * Prevents timing attacks that could reveal the token.
+ */
+function constantTimeEquals(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+/**
+ * Extract and validate the bearer token from the Authorization header.
+ * Returns true if the token matches the expected value (or if auth is disabled).
+ * The header's UTF-8 byte length is bounded before parsing or comparison, so
+ * oversized values take the same unauthorised path as other malformed headers.
+ */
+function isValidAuth(
+  authHeader: string | undefined,
+  expectedToken: string | null | undefined,
+): boolean {
+  // No token configured (null, or absent from a config built before #546):
+  // the server is loopback-only, which config validation enforces.
+  if (expectedToken === null || expectedToken === undefined) return true;
+  if (authHeader === undefined) return false;
+  if (Buffer.byteLength(authHeader, "utf8") > MAX_AUTH_HEADER_BYTES) return false;
+
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match || match[1] === undefined) return false;
+
+  const providedToken = match[1];
+  return constantTimeEquals(providedToken, expectedToken);
 }
 
 function previewCursor(cursor: string | null): string | null {
@@ -181,18 +281,23 @@ export function buildHealthReport(
   } else {
     const failureBudget = Math.max(3, Math.ceil(60_000 / Math.max(config.pollIntervalMs, 1)));
     const tooManyFailures = poller.consecutiveFailures >= failureBudget;
+    const hasStaleCursor = poller.targets.some((target) => target.cursorStale === true);
+    // A stalled cursor is a live fault the failure counters cannot see: every
+    // cycle succeeds, it just never makes progress.
+    const hasStalledCursor = poller.targets.some((target) => target.cursorStalled === true);
     const hasEverSucceeded = poller.lastSuccessAt !== null;
     const stale =
       hasEverSucceeded &&
       config.healthStaleMs > 0 &&
       nowMs - (poller.lastSuccessAt as number) > config.healthStaleMs;
-    status = tooManyFailures || stale ? "degraded" : "ok";
+    status = tooManyFailures || stale || hasStaleCursor || hasStalledCursor ? "degraded" : "ok";
   }
 
   return {
     ok: status === "ok",
     status,
     service: "mimir-telegram-bot",
+    version: config.version,
     network: networkLabel(config),
     uptimeMs,
     checkedAt: new Date(nowMs).toISOString(),
@@ -202,6 +307,7 @@ export function buildHealthReport(
       stopping: poller.stopping === true,
       channelPreviewMode: config.channelPreviewMode === true,
       cycles: poller.cycles,
+      lastCorrelationId: poller.lastCorrelationId ?? null,
       lastPollAt: iso(poller.lastPollAt),
       lastSuccessAt: iso(poller.lastSuccessAt),
       latestLedger: poller.latestLedger,
@@ -212,25 +318,141 @@ export function buildHealthReport(
       notificationsFailed: poller.notificationsFailed,
       eventsSkipped: poller.eventsSkipped,
       eventsDeduplicated: poller.eventsDeduplicated ?? 0,
+      activity: poller.activityBaseline ?? emptyActivityBaseline(),
       notificationsDropped: poller.notificationsDropped ?? 0,
       cursorRewinds: poller.cursorRewinds ?? 0,
+      deadLetter: {
+        depth: poller.deadLetter?.depth ?? 0,
+        enqueued: poller.deadLetter?.enqueued ?? 0,
+        replayed: poller.deadLetter?.replayed ?? 0,
+        dropped: poller.deadLetter?.dropped ?? 0,
+      },
       consecutiveFailures: poller.consecutiveFailures,
+      suppressedLogs: poller.suppressedLogs ?? 0,
       lastError: poller.lastError
-        ? { at: new Date(poller.lastError.at).toISOString(), message: poller.lastError.message }
+        ? {
+            at: new Date(poller.lastError.at).toISOString(),
+            message: redactText(poller.lastError.message),
+          }
+        : null,
+      restartGaps: poller.restartGaps ?? 0,
+      lastRestartGap: poller.lastRestartGap
+        ? {
+            at: new Date(poller.lastRestartGap.at).toISOString(),
+            source: poller.lastRestartGap.source,
+            cursorLedger: poller.lastRestartGap.cursorLedger,
+            oldestLedger: poller.lastRestartGap.oldestLedger,
+            missedLedgers: poller.lastRestartGap.missedLedgers,
+          }
         : null,
       pendingFlush: poller.pendingFlush === true,
       lastFlushAt: iso(poller.lastFlushAt ?? null),
       targets: poller.targets.map((t) => ({
         source: t.source,
+        version: t.version ?? "v1",
         contractId: t.contractId,
+        lastCycleMs: t.lastCycleMs ?? 0,
+        maxCycleMs: t.maxCycleMs ?? 0,
         lastEventLedger: t.lastEventLedger,
         cursorPreview: previewCursor(t.cursor),
+        gapLedgers: typeof t.gapLedgers === "number" ? t.gapLedgers : 0,
+        cursorResetAt: iso(t.cursorResetAt ?? null),
+        cursorUnreadable: t.cursorUnreadable === true,
         rewindFromLedger: typeof t.rewindFromLedger === "number" ? t.rewindFromLedger : null,
+        cursorStale: t.cursorStale === true,
+        cursorStalled: t.cursorStalled === true,
+        cyclesWithoutAdvance: t.cyclesWithoutAdvance,
         hasError: t.lastError !== null,
       })),
+      persistentVolumeAvailable: poller.persistentVolumeAvailable ?? true,
+      persistentVolumeError: poller.persistentVolumeError ?? null,
     },
     config: provenance,
   };
+}
+
+/**
+ * Render poller status as Prometheus metrics.
+ */
+export function buildMetricsReport(
+  config: BotConfig,
+  poller: PollerStatus,
+  nowMs: number = Date.now(),
+): string {
+  const uptimeMs = poller.startedAt > 0 ? Math.max(0, nowMs - poller.startedAt) : 0;
+  const network = networkLabel(config);
+  const activity = poller.activityBaseline ?? emptyActivityBaseline();
+
+  const lines: string[] = [
+    `# HELP mimir_telegram_uptime_ms Uptime in milliseconds`,
+    `# TYPE mimir_telegram_uptime_ms gauge`,
+    `mimir_telegram_uptime_ms{network="${network}"} ${uptimeMs}`,
+    ``,
+    `# HELP mimir_telegram_poller_running Whether the poller is currently running (1) or stopped/paused (0)`,
+    `# TYPE mimir_telegram_poller_running gauge`,
+    `mimir_telegram_poller_running{network="${network}"} ${poller.running && !poller.paused ? 1 : 0}`,
+    ``,
+    `# HELP mimir_telegram_poller_cycles_total Total number of completed poll cycles`,
+    `# TYPE mimir_telegram_poller_cycles_total counter`,
+    `mimir_telegram_poller_cycles_total{network="${network}"} ${poller.cycles}`,
+    ``,
+    `# HELP mimir_telegram_notifications_sent_total Total number of Telegram messages successfully sent`,
+    `# TYPE mimir_telegram_notifications_sent_total counter`,
+    `mimir_telegram_notifications_sent_total{network="${network}"} ${poller.notificationsSent}`,
+    ``,
+    `# HELP mimir_telegram_notifications_failed_total Total number of Telegram messages that failed to send after retries`,
+    `# TYPE mimir_telegram_notifications_failed_total counter`,
+    `mimir_telegram_notifications_failed_total{network="${network}"} ${poller.notificationsFailed}`,
+    ``,
+    `# HELP mimir_telegram_events_skipped_total Total number of events skipped (unrecognized, unformatted, or rate-limited)`,
+    `# TYPE mimir_telegram_events_skipped_total counter`,
+    `mimir_telegram_events_skipped_total{network="${network}"} ${poller.eventsSkipped}`,
+    ``,
+    `# HELP mimir_telegram_consecutive_failures Current number of consecutive failed poll cycles`,
+    `# TYPE mimir_telegram_consecutive_failures gauge`,
+    `mimir_telegram_consecutive_failures{network="${network}"} ${poller.consecutiveFailures}`,
+    ``,
+    `# HELP mimir_telegram_activity_last_cycle_events Events observed in the most recent complete poll cycle`,
+    `# TYPE mimir_telegram_activity_last_cycle_events gauge`,
+    `mimir_telegram_activity_last_cycle_events{network="${network}"} ${activity.lastValue ?? 0}`,
+    ``,
+    `# HELP mimir_telegram_activity_baseline_events Mean events per cycle in the rolling baseline (0 while warming up)`,
+    `# TYPE mimir_telegram_activity_baseline_events gauge`,
+    `mimir_telegram_activity_baseline_events{network="${network}"} ${activity.baselineMean ?? 0}`,
+    ``,
+    `# HELP mimir_telegram_activity_deviation Z-score of the latest complete cycle against the rolling baseline (0 while warming up)`,
+    `# TYPE mimir_telegram_activity_deviation gauge`,
+    `mimir_telegram_activity_deviation{network="${network}"} ${activity.zScore ?? 0}`,
+    ``,
+    `# HELP mimir_telegram_activity_anomalies_total Complete cycles classified as a spike or drop against the rolling baseline`,
+    `# TYPE mimir_telegram_activity_anomalies_total counter`,
+    `mimir_telegram_activity_anomalies_total{network="${network}"} ${activity.anomalies}`,
+  ];
+
+  if (poller.latestLedger !== null) {
+    lines.push(
+      ``,
+      `# HELP mimir_telegram_latest_ledger Highest ledger seen by the poller`,
+      `# TYPE mimir_telegram_latest_ledger gauge`,
+      `mimir_telegram_latest_ledger{network="${network}"} ${poller.latestLedger}`
+    );
+  }
+
+  const targetsWithLedgers = poller.targets.filter((t) => t.lastEventLedger !== null);
+  if (targetsWithLedgers.length > 0) {
+    lines.push(
+      ``,
+      `# HELP mimir_telegram_target_last_event_ledger Highest ledger in which an event was processed for a target`,
+      `# TYPE mimir_telegram_target_last_event_ledger gauge`,
+    );
+    for (const target of targetsWithLedgers) {
+      lines.push(
+        `mimir_telegram_target_last_event_ledger{network="${network}",source="${target.source}",contract="${target.contractId}"} ${target.lastEventLedger}`
+      );
+    }
+  }
+
+  return lines.join("\\n") + "\\n";
 }
 
 function sendJson(
@@ -247,6 +469,35 @@ function sendJson(
   res.end(payload);
 }
 
+const HEALTH_GET_ROUTES = new Set([
+  "/",
+  "/health",
+  "/healthz",
+  "/health/live",
+  "/livez",
+  "/metrics",
+]);
+
+function sendMethodNotAllowed(res: http.ServerResponse, allow: string): void {
+  const payload = `${JSON.stringify({ ok: false, error: "method_not_allowed" })}\n`;
+  res.writeHead(405, {
+    "allow": allow,
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "content-length": Buffer.byteLength(payload),
+  });
+  res.end(payload);
+}
+
+function sendUnauthorized(res: http.ServerResponse): void {
+  res.writeHead(401, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "content-length": "0",
+  });
+  res.end();
+}
+
 /**
  * Start the local health HTTP server.
  *
@@ -254,7 +505,7 @@ function sendJson(
  * useful for unit tests and one-shot CLI runs that must not bind a port.
  */
 export function startHealthServer(deps: HealthDeps): HealthServer {
-  const { config, status } = deps;
+  const { config, status, logs } = deps;
   const now = deps.now ?? Date.now;
   const provenance = deps.provenance ?? configProvenance;
 
@@ -266,6 +517,17 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
   const server = http.createServer((req, res) => {
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", `http://${config.healthHost}`);
+
+    // Check authentication for all routes when token is configured
+    if (!isValidAuth(req.headers.authorization, config.healthAuthToken)) {
+      sendUnauthorized(res);
+      return;
+    }
+
+    if (HEALTH_GET_ROUTES.has(url.pathname) && method !== "GET") {
+      sendMethodNotAllowed(res, "GET");
+      return;
+    }
 
     if (method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz")) {
       const report = buildHealthReport(config, status(), now(), provenance());
@@ -280,8 +542,20 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
         ok: true,
         status: "live",
         service: "mimir-telegram-bot",
+        version: config.version,
         checkedAt: new Date(now()).toISOString(),
       });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/metrics") {
+      const metrics = buildMetricsReport(config, status(), now());
+      res.writeHead(200, {
+        "content-type": "text/plain; version=0.0.4; charset=utf-8",
+        "cache-control": "no-store",
+        "content-length": Buffer.byteLength(metrics),
+      });
+      res.end(metrics);
       return;
     }
 
@@ -290,6 +564,7 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
         service: "mimir-telegram-bot",
         health: "/health",
         live: "/health/live",
+        metrics: "/metrics",
       });
       return;
     }
@@ -299,7 +574,7 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
 
   // Failures after listen (e.g. client aborts) must not take down the notifier.
   server.on("error", (err) => {
-    console.error(`[health] server error: ${err instanceof Error ? err.message : err}`);
+    console.error(`[health] server error: ${safeErrorMessage(err)}`);
   });
 
   server.listen(config.healthPort, config.healthHost);
@@ -307,7 +582,10 @@ export function startHealthServer(deps: HealthDeps): HealthServer {
   const address = server.address() as AddressInfo | null;
   const port = address?.port ?? config.healthPort;
   const url = `http://${config.healthHost}:${port}`;
-  console.log(`[health] listening on ${url} (GET /health, GET /health/live)`);
+  console.log(
+    `[health] listening on ${url} (GET /health, GET /health/live` +
+      `${logs && logs.capacity() > 0 ? ", GET /health/diag" : ""})`,
+  );
 
   return {
     url,

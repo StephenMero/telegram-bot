@@ -47,18 +47,27 @@ import {
   clampStartLedger,
   createRpcServer,
   LedgerWindowError,
+  validateContractId,
   validateLedgerWindow,
   type LedgerWindow,
 } from "./client.js";
+import type { LedgerTip } from "./ledger-cache.js";
 import {
   decodeEvent,
   dedupeEvents,
   formatUsdc,
   isAdminPayload,
+  shortAddress,
   sortEvents,
+  normalizeContractVersion,
+  summarizePayloadForLog,
   type ContractSource,
   type DecodedEvent,
 } from "./decode.js";
+import { formatRpcTiming, RpcTiming, type RpcTimingSummary } from "./metrics.js";
+import { assertEventsResponse } from "./rpc-guard.js";
+import { formatScanJsonl } from "./scan-jsonl.js";
+import { formatScanMarkdown } from "./scan-markdown.js";
 
 /** Events per request. The RPC caps this; 200 is well inside it. */
 export const EVENT_PAGE_LIMIT = 200;
@@ -91,6 +100,18 @@ export interface ScanOptions {
    * disables deduplication. Defaults to {@link DEFAULT_DEDUP_WINDOW}.
    */
   dedupWindow?: number | undefined;
+  /**
+   * Chain tip cached by the caller for this poll cycle. When set the walk does
+   * not call `getHealth()`; the caller owns refreshing it per cycle (see
+   * {@link import("./ledger-cache.js").LedgerCache}). Omitted means a one-shot
+   * scan — the `scan` CLI, a test — fetches its own tip.
+   */
+  ledgerTip?: LedgerTip | undefined;
+  /**
+   * Optional hook to filter which events have full values decoded.
+   * If `shouldDecode(name)` returns false, value decoding is skipped.
+   */
+  shouldDecode?: (name: string) => boolean;
 }
 
 export interface RawScan {
@@ -103,13 +124,34 @@ export interface RawScan {
   /** True when `maxPages` stopped the walk before the tip. */
   truncated: boolean;
   pages: number;
+  /** Pages the RPC returned with zero events (the Soroban norm on a quiet chain). */
+  emptyPages: number;
   /** Events dropped because an earlier page or cycle already returned them. */
   duplicates: number;
+  /**
+   * The dedup window AFTER this walk: the ids seeded via `seenEventIds` plus
+   * the key of every identified event read, oldest-first. Persist this to
+   * suppress the redelivery the inclusive cursor hands back next cycle.
+   *
+   * Keys are derived from the RAW responses here — where `topic` content still
+   * exists — because a decoded event alone cannot always re-derive the same
+   * key (it carries no `topic`). Entries whose key could not be derived are
+   * absent by construction: those events are passed through undeduplicated.
+   */
+  seenEventIds: string[];
   /** Ledger the walk started from after clamping, or null when resuming. */
   startLedger: number | null;
   /** True when the requested start was below the retained floor and clamped up. */
   startClamped: boolean;
+  /**
+   * Privacy-safe timing for every RPC await in this walk (counts + ms only;
+   * never a request/response payload). One `health` request, then one per page.
+   */
+  timing: RpcTimingSummary;
 }
+
+const MAX_UINT32 = 4_294_967_295n;
+const MAX_UINT64 = 18_446_744_073_709_551_615n;
 
 /**
  * A cursor is `<TOID>-<index>`, and a TOID packs the ledger sequence into its
@@ -123,10 +165,19 @@ export interface RawScan {
  */
 export function eventCursorLedger(cursor: string): number | null {
   if (typeof cursor !== "string") return null;
-  const toid = cursor.split("-")[0];
-  if (!toid || !/^\d+$/.test(toid)) return null;
+  const match = /^(\d+)-(\d+)$/.exec(cursor);
+  if (!match) return null;
+
+  const toidText = match[1];
+  const indexText = match[2];
+  if (toidText === undefined || indexText === undefined) return null;
+  if (toidText.length > 20 || indexText.length > 10) return null;
+
   try {
-    return Number(BigInt(toid) >> 32n);
+    const toid = BigInt(toidText);
+    const index = BigInt(indexText);
+    if (toid > MAX_UINT64 || index > MAX_UINT32) return null;
+    return Number(toid >> 32n);
   } catch {
     return null;
   }
@@ -170,7 +221,15 @@ export async function paginatedGetEvents(
   const limit = Math.max(1, opts.limit ?? EVENT_PAGE_LIMIT);
   const maxPages = Math.max(1, opts.maxPages ?? EVENT_MAX_PAGES);
 
-  const window = validateLedgerWindow(await server.getHealth());
+  // Time every RPC await in this walk (the health probe + each page) so the
+  // scan output can report how long the network cost, not just how many pages
+  // it took. Bounded to counts and milliseconds; no payload is retained.
+  const timing = new RpcTiming();
+  // A caller-cached tip (one per poll cycle) replaces this walk's own health
+  // read; a one-shot scan still fetches its own.
+  const window = validateLedgerWindow(
+    opts.ledgerTip ?? (await timing.measure("health", () => server.getHealth())),
+  );
   const oldestLedger = window.oldestLedger;
 
   // One window for the whole walk, pre-seeded with what earlier cycles have
@@ -179,9 +238,10 @@ export async function paginatedGetEvents(
   const dedup = new EventDedupWindow(opts.dedupWindow ?? DEFAULT_DEDUP_WINDOW);
   for (const id of opts.seenEventIds ?? []) dedup.add(id);
 
-  const events: rpc.Api.EventResponse[] = [];
   let cursor: string | undefined = opts.cursor;
-  let lastCursor: string | null = opts.cursor ?? null;
+
+  const events: rpc.Api.EventResponse[] = [];
+  let lastCursor: string | null = cursor ?? null;
   let previousCursor = "";
   let latestLedger = window.latestLedger;
   let truncated = false;
@@ -217,6 +277,7 @@ export async function paginatedGetEvents(
   }
 
   const firstStartLedger = startLedger ?? window.oldestLedger;
+  let emptyPages = 0;
 
   for (;;) {
     if (pages >= maxPages) {
@@ -227,11 +288,16 @@ export async function paginatedGetEvents(
 
     // The two request shapes are a discriminated union on `cursor`, so they are
     // built separately rather than spread into one object.
-    const response: rpc.Api.GetEventsResponse = cursor
-      ? await server.getEvents({ filters, cursor, limit })
-      : await server.getEvents({ filters, startLedger: firstStartLedger, limit });
+    const response: rpc.Api.GetEventsResponse = await timing.measure("events", () =>
+      cursor
+        ? server.getEvents({ filters, cursor, limit })
+        : server.getEvents({ filters, startLedger: firstStartLedger, limit }),
+    );
+    assertEventsResponse(response);
 
+    // A malformed page (non-array `events`) is an empty page, not a crash.
     const rawEvents = Array.isArray(response?.events) ? response.events : [];
+    if (rawEvents.length === 0) emptyPages += 1;
     // Drop anything an earlier page (or an earlier cycle) already produced.
     // Order is preserved: the first occurrence wins, matching the RPC's own
     // event ordering.
@@ -264,31 +330,40 @@ export async function paginatedGetEvents(
     oldestLedger,
     truncated,
     pages,
+    emptyPages,
     duplicates,
+    seenEventIds: dedup.toJSON(),
     startLedger,
     startClamped,
+    timing: timing.summary(),
   };
 }
 
 export interface WatchTarget {
   source: ContractSource;
   contractId: string;
+  version?: string;
 }
 
 export interface ContractScan extends Omit<RawScan, "events"> {
   source: ContractSource;
   contractId: string;
+  version: string;
   events: DecodedEvent[];
   /** Highest ledger among the returned events, or null when there were none. */
   lastEventLedger: number | null;
 }
 
-/** Scan one contract and decode everything it returned. */
+/** Scan one contract and decode everything it returned for the configured version. */
 export async function readContractEvents(
   server: rpc.Server,
   target: WatchTarget,
   opts: ScanOptions = {},
 ): Promise<ContractScan> {
+  // Validate contract ID at scan time so misconfigurations surface early
+  // with an actionable error tied to the specific target.
+  validateContractId(target.contractId, `${target.source} contract ID`);
+
   const scan = await paginatedGetEvents(
     server,
     [{ type: "contract", contractIds: [target.contractId] }],
@@ -302,7 +377,7 @@ export async function readContractEvents(
   const decoded: DecodedEvent[] = [];
   for (const event of rawEvents) {
     if (!event || typeof event !== "object") continue;
-    decoded.push(decodeEvent(target.source, event));
+    decoded.push(decodeEvent(target.source, event, target.version, { shouldDecode: opts.shouldDecode }));
   }
 
   // Deterministic order from chain metadata (ledger → transaction index →
@@ -314,21 +389,32 @@ export async function readContractEvents(
   return {
     source: target.source,
     contractId: target.contractId,
+    version: normalizeContractVersion(target.version),
     events,
     cursor: scan.cursor,
     latestLedger: scan.latestLedger,
     oldestLedger: scan.oldestLedger,
     truncated: scan.truncated,
     pages: scan.pages,
+    emptyPages: scan.emptyPages,
     duplicates: scan.duplicates,
+    seenEventIds: scan.seenEventIds,
     startLedger: scan.startLedger,
     startClamped: scan.startClamped,
+    timing: scan.timing,
     lastEventLedger: ledgers.length > 0 ? Math.max(...ledgers) : null,
   };
 }
 
 // ── Standalone verification CLI ───────────────────────────────────────────────
 //
+//   npm run scan                         # both contracts, from the retained floor
+//   npm run scan -- --pages 40           # walk further
+//   npm run scan -- --show 5             # print 5 decoded events per contract (capped at 200)
+//   npm run scan -- --from 123456        # explicit start ledger
+//   npm run scan -- --contract market    # scan only the market contract
+//   npm run scan -- --contract squad     # scan only the squad contract
+//   npm run scan -- --help               # show this help
 //   npm run scan                  # both contracts, from the retained floor
 //   npm run scan -- --pages 40    # walk further
 //   npm run scan -- --show 5      # print 5 decoded events per contract
@@ -350,10 +436,51 @@ export async function readContractEvents(
 // The same built binary also renders the operator audit report (npm run audit,
 // src/audit-cli.ts): report from data/audit.jsonl, --tail, --json, --file.
 
+const SCAN_SHOW_MAX = 200;
+
+const HELP_TEXT = `
+Usage: npm run scan [-- <options>]
+
+Options:
+  --pages <n>         Maximum pages to fetch per contract (default: ${EVENT_MAX_PAGES})
+  --show <n>          Decoded events to print per contract (default: 3, max: ${SCAN_SHOW_MAX})
+  --from <ledger>     Start from this ledger instead of the retained floor
+  --contract <name>   Scan only one contract: "market" or "squad"
+  --help              Show this message
+
+Examples:
+  npm run scan
+  npm run scan -- --pages 40
+  npm run scan -- --show 20
+  npm run scan -- --from 4226500
+  npm run scan -- --contract market --show 10
+
+No BOT_TOKEN required — reads live Testnet data using the public Soroban RPC.
+`.trim();
+
 function flag(name: string): string | undefined {
   const index = process.argv.indexOf(`--${name}`);
   if (index === -1) return undefined;
   return process.argv[index + 1];
+}
+
+function flagBool(name: string): boolean {
+  return process.argv.includes(`--${name}`);
+}
+
+function flagInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = flag(name);
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+    console.error(`[scan] --${name}: expected an integer, got "${raw}"`);
+    process.exit(1);
+  }
+  if (parsed < min || parsed > max) {
+    console.error(`[scan] --${name}: must be between ${min} and ${max}, got ${parsed}`);
+    process.exit(1);
+  }
+  return parsed;
 }
 
 /** True when `--name` appears anywhere in argv (boolean CLI switches). */
@@ -388,6 +515,8 @@ export interface ScanJsonTarget {
   startLedger: number | null;
   /** True when the requested start was below the retained floor and clamped up. */
   startClamped: boolean;
+  /** RPC request timing for this contract's walk (counts + ms only). */
+  rpcTiming?: RpcTimingSummary;
   histogram: Record<string, number>;
   /** Last N decoded events (controlled by `--show`); never includes secrets. */
   events: ScanJsonEvent[];
@@ -398,6 +527,8 @@ export interface ScanJsonReport {
   network: string;
   rpcUrl: string;
   ledgers: { oldest: number; latest: number };
+  /** Timing for the startup health probe; per-target timing lives on each target. */
+  rpcTiming?: RpcTimingSummary;
   targets: ScanJsonTarget[];
 }
 
@@ -427,6 +558,7 @@ export function buildScanJsonTarget(scan: ContractScan, show: number): ScanJsonT
     cursor: scan.cursor,
     startLedger: scan.startLedger ?? null,
     startClamped: scan.startClamped ?? false,
+    rpcTiming: scan.timing,
     histogram: eventHistogram(scan.events),
     // slice(-0) would return everything, so show=0 must be special-cased
     events: (limit > 0 ? scan.events.slice(-limit) : []).map((event) => ({
@@ -444,6 +576,7 @@ export function buildScanJsonReport(input: {
   rpcUrl: string;
   oldestLedger: number;
   latestLedger: number;
+  rpcTiming?: RpcTimingSummary;
   targets: ScanJsonTarget[];
 }): ScanJsonReport {
   return {
@@ -451,6 +584,7 @@ export function buildScanJsonReport(input: {
     network: input.network,
     rpcUrl: input.rpcUrl,
     ledgers: { oldest: input.oldestLedger, latest: input.latestLedger },
+    rpcTiming: input.rpcTiming,
     targets: input.targets,
   };
 }
@@ -489,52 +623,53 @@ export async function runAuditCli(): Promise<void> {
 function summarize(event: DecodedEvent): string {
   const p = event.payload;
   const money = (v: bigint) => `${formatUsdc(v)} USDC`;
+  const text = (value: string, max = 200): string => {
+    const compact = value.replace(/\s+/g, " ").trim();
+    return compact.length <= max ? compact : `${compact.slice(0, max - 1)}…`;
+  };
   switch (p.name) {
     case "claim_created":
-      return `claim #${p.claimId} created by ${p.creator} [${p.category}]`;
+      return `claim #${p.claimId} created by ${shortAddress(p.creator)} [${text(p.category, 80)}]`;
     case "claim_challenged":
-      return `claim #${p.claimId} challenged by ${p.challenger} for ${money(p.stake)}`;
+      return `claim #${p.claimId} challenged by ${shortAddress(p.challenger)} for ${money(p.stake)}`;
     case "claim_resolved":
       return `claim #${p.claimId} resolved winner_side=${p.winnerSide} confidence=${p.confidence}`;
     case "market_settled":
       return `claim #${p.claimId} settled paid=${money(p.totalPaid)} fees=${money(p.totalFees)}`;
     case "challenger_paid":
-      return `claim #${p.claimId} paid ${p.challenger} net=${money(p.net)}`;
+      return `claim #${p.claimId} paid ${shortAddress(p.challenger)} net=${money(p.net)}`;
     case "market_created":
-      return `squad market #${p.marketId} by ${p.captain}: ${p.question}`;
+      return `squad market #${p.marketId} by ${shortAddress(p.captain)}: ${text(p.question)}`;
     case "deposited":
-      return `squad #${p.marketId} side=${p.side} ${p.participant} deposited ${money(p.amount)}`;
+      return `squad #${p.marketId} side=${p.side} ${shortAddress(p.participant)} deposited ${money(p.amount)}`;
     case "resolved":
       return `squad #${p.marketId} resolved result=${p.result}`;
     case "claimed":
-      return `squad #${p.marketId} ${p.participant} claimed net=${money(p.net)}`;
+      return `squad #${p.marketId} ${shortAddress(p.participant)} claimed net=${money(p.net)}`;
     case "oracle_changed":
-      return `oracle changed to ${p.newOracle ?? "unknown"}`;
+      return `oracle changed to ${p.newOracle ? shortAddress(p.newOracle) : "unknown"}`;
     case "ownership_transferred":
-      return `ownership transferred to ${p.newOwner ?? "unknown"}`;
+      return `ownership transferred to ${p.newOwner ? shortAddress(p.newOwner) : "unknown"}`;
     case "agent_attributed":
-      return `agent attributed ${p.agent ?? "unknown"}`;
+      return `agent attributed ${p.agent ? shortAddress(p.agent) : "unknown"}`;
     case "fee_accrued":
-      return `fee accrued ${p.amount !== undefined ? money(p.amount) : ""} to ${p.recipient ?? "unknown"}`;
+      return `fee accrued ${p.amount !== undefined ? money(p.amount) : ""} to ${p.recipient ? shortAddress(p.recipient) : "unknown"}`;
     case "admin":
       return `admin event ${p.action}`;
     case "unknown":
-      return `unknown "${p.eventName}"${p.reason ? ` (${p.reason})` : ""}`;
+      return `unknown "${text(p.eventName, 80)}"${p.reason ? ` (${text(p.reason)})` : ""}`;
     default:
       if (isAdminPayload(p)) return `admin event ${p.name}`;
       return p.name;
   }
 }
 
-function boundedJson(value: unknown): string {
-  return JSON.stringify(value, (_key, item) => {
-    if (typeof item !== "string") return typeof item === "bigint" ? item.toString() : item;
-    const compact = item.replace(/\s+/g, " ").trim();
-    return compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`;
-  });
-}
-
 async function main(): Promise<void> {
+  if (flagBool("help") || flagBool("h")) {
+    console.log(HELP_TEXT);
+    return;
+  }
+
   // `--mock` opts into the local mock profile before config is read. An
   // explicit MIMIR_PROFILE in the environment still wins; blank counts as unset.
   if (process.argv.includes("--mock") && !process.env.MIMIR_PROFILE?.trim()) {
@@ -543,36 +678,57 @@ async function main(): Promise<void> {
 
   const config = loadStellarConfig();
   const server = createRpcServer(config);
-  const pages = Number(flag("pages") ?? EVENT_MAX_PAGES);
-  const show = Number(flag("show") ?? 3);
+  const pages = flagInt("pages", EVENT_MAX_PAGES, 1, 1000);
+  const show = flagInt("show", 3, 0, SCAN_SHOW_MAX);
   const from = flag("from");
-  const asJson = hasFlag("json");
+  const contractArg = flag("contract");
 
-  const health = await server.getHealth();
+  // Validate --contract early so the error is clear before any network call.
+  const validContracts = ["market", "squad"] as const;
+  type ContractArg = (typeof validContracts)[number];
+  if (contractArg !== undefined && !(validContracts as readonly string[]).includes(contractArg)) {
+    console.error(
+      `[scan] --contract: expected "market" or "squad", got "${contractArg}"\n` +
+        `Run with --help for usage.`,
+    );
+    process.exit(1);
+  }
+  const asJson = hasFlag("json");
+  const asJsonl = hasFlag("jsonl");
+  const asMarkdown = hasFlag("markdown");
+  const machineOutput = asJson || asJsonl || asMarkdown;
+
+  const probeTiming = new RpcTiming();
+  const health = await probeTiming.measure("health", () => server.getHealth());
   const network = networkLabel(config);
 
-  // When `--json` is set, stdout is reserved for one JSON document. Progress
-  // goes to stderr so piping (`npm run scan -- --json | jq`) stays valid.
-  const progress = asJson ? console.error.bind(console) : console.log.bind(console);
+  // When `--json`, `--jsonl`, or `--markdown` is set, stdout is reserved for machine output.
+  // Progress goes to stderr so piping (`npm run scan -- --json | jq`) stays valid.
+  const progress = machineOutput ? console.error.bind(console) : console.log.bind(console);
 
-  if (!asJson) {
+  if (!machineOutput) {
     console.log(`RPC        ${config.rpcUrl} (${network})`);
     console.log(`ledgers    oldest=${health.oldestLedger} latest=${health.latestLedger}`);
+    console.log(formatRpcTiming(probeTiming.summary()));
   } else {
     progress(
       `scanning ${network} ledgers oldest=${health.oldestLedger} latest=${health.latestLedger}`,
     );
   }
 
-  const targets: WatchTarget[] = [
+  const allTargets: WatchTarget[] = [
     { source: "market", contractId: config.marketContractId },
     { source: "squad", contractId: config.squadContractId },
   ];
 
+  const targets = contractArg
+    ? allTargets.filter((t) => t.source === (contractArg as ContractArg))
+    : allTargets;
   const jsonTargets: ScanJsonTarget[] = [];
+  const jsonlEvents: DecodedEvent[] = [];
 
   for (const target of targets) {
-    if (!asJson) {
+    if (!machineOutput) {
       console.log(`\n=== ${target.source}  ${target.contractId} ===`);
     }
 
@@ -581,7 +737,15 @@ async function main(): Promise<void> {
       startLedger: from ? Number(from) : health.oldestLedger,
     });
 
-    if (asJson) {
+    if (asJsonl) {
+      jsonlEvents.push(...scan.events);
+      progress(
+        `scanned ${target.source}: events=${scan.events.length} pages=${scan.pages} truncated=${scan.truncated}`,
+      );
+      continue;
+    }
+
+    if (asJson || asMarkdown) {
       jsonTargets.push(buildScanJsonTarget(scan, show));
       progress(
         `scanned ${target.source}: events=${scan.events.length} pages=${scan.pages} truncated=${scan.truncated}`,
@@ -592,10 +756,11 @@ async function main(): Promise<void> {
     const counts = eventHistogram(scan.events);
 
     console.log(
-      `pages=${scan.pages} events=${scan.events.length} duplicates=${scan.duplicates} ` +
+      `pages=${scan.pages} emptyPages=${scan.emptyPages} events=${scan.events.length} duplicates=${scan.duplicates} ` +
         `truncated=${scan.truncated} lastEventLedger=${scan.lastEventLedger} cursor=${scan.cursor} ` +
         `start=${scan.startLedger ?? "cursor"}${scan.startClamped ? " (clamped)" : ""}`,
     );
+    console.log(`  ${formatRpcTiming(scan.timing)}`);
     for (const [name, count] of Object.entries(counts)) {
       console.log(`  ${count.toString().padStart(4)}  ${name}`);
     }
@@ -603,21 +768,22 @@ async function main(): Promise<void> {
     for (const event of show > 0 ? scan.events.slice(-show) : []) {
       console.log(`\n  ledger ${event.ledger}  tx ${event.txHash}`);
       console.log(`  ${summarize(event)}`);
-      console.log(
-        `  ${boundedJson(event.payload)}`,
-      );
+      console.log(`  ${summarizePayloadForLog(event.payload)}`);
     }
   }
 
-  if (asJson) {
+  if (asJsonl) {
+    process.stdout.write(formatScanJsonl(jsonlEvents));
+  } else if (asJson || asMarkdown) {
     const report = buildScanJsonReport({
       network,
       rpcUrl: config.rpcUrl,
       oldestLedger: health.oldestLedger,
       latestLedger: health.latestLedger,
+      rpcTiming: probeTiming.summary(),
       targets: jsonTargets,
     });
-    process.stdout.write(formatScanJson(report));
+    process.stdout.write(asMarkdown ? formatScanMarkdown(report) : formatScanJson(report));
   }
 }
 

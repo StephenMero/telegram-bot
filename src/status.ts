@@ -40,12 +40,18 @@ export const MAX_ERROR_CHARS = 300;
 /** Longest cursor string kept. Real cursors are `<TOID>-<index>`, far shorter. */
 export const MAX_CURSOR_CHARS = 128;
 
+/** Longest send-duration string kept. Real values are short, e.g. `1234ms`. */
+export const MAX_SEND_DURATION_CHARS = 32;
+
 /**
  * Collapse whitespace and truncate. Applied to every string that originates
  * outside this process (RPC errors, Telegram errors, cursors), so the snapshot
  * and the logs derived from it stay bounded and single-line.
  */
-export function boundText(value: string, max = MAX_ERROR_CHARS): string {
+export function boundText(value: string | null | undefined, max = MAX_ERROR_CHARS): string {
+  // A missing message (an error without one) bounds to "", never a TypeError
+  // while the status snapshot is being written.
+  if (typeof value !== "string") return "";
   const collapsed = value.replace(/\s+/g, " ").trim();
   if (collapsed.length <= max) return collapsed;
   return `${collapsed.slice(0, max - 1)}…`;
@@ -56,7 +62,8 @@ export function boundText(value: string, max = MAX_ERROR_CHARS): string {
  * sign and last four digits; a `@username` keeps only the leading character.
  * Enough to tell two deployments apart, not enough to be a usable target.
  */
-export function redactChatId(chatId: string): string {
+export function redactChatId(chatId: string | undefined): string {
+  if (typeof chatId !== "string") return "…";
   if (chatId.startsWith("@")) {
     return chatId.length > 1 ? `@${chatId[1]}…` : "@…";
   }
@@ -69,6 +76,10 @@ export function redactChatId(chatId: string): string {
 export interface StatusTargetSnapshot {
   source: string;
   contractId: string;
+  /** Duration of this target's most recent attempted cycle. */
+  lastCycleMs: number;
+  /** Longest attempted cycle for this target since process start. */
+  maxCycleMs: number;
   cursor: string | null;
   lastEventLedger: number | null;
   /**
@@ -76,7 +87,21 @@ export interface StatusTargetSnapshot {
    * A bounded ledger number, never a cursor, token, or remote payload.
    */
   rewindFromLedger: number | null;
+  /** RPC rejected this target's cursor as stale; true until a scan succeeds. */
+  cursorStale: boolean;
   lastError: string | null;
+  /**
+   * Bounded description of the most recent per-send timeout, or null. Never a
+   * token, chat id, or remote payload — only a coarse reason and duration.
+   */
+  lastSendTimeout: string | null;
+}
+
+export interface PollerCounterSnapshot {
+  cycles: number;
+  notificationsSent: number;
+  notificationsFailed: number;
+  eventsSkipped: number;
 }
 
 export interface StatusSnapshot {
@@ -99,9 +124,22 @@ export interface StatusSnapshot {
   notificationsSent: number;
   notificationsFailed: number;
   eventsSkipped: number;
+  /** Counter values accumulated since this process started. */
+  sinceStart: PollerCounterSnapshot;
+  /** Cumulative counter values persisted across restarts for the current contract IDs. */
+  cumulative: PollerCounterSnapshot;
+  /** Suppressed by the bounded dedup window as already-processed. */
+  eventsDeduplicated: number;
   /** Cursors automatically rewound to the RPC's retained floor this run. */
   cursorRewinds: number;
   consecutiveFailures: number;
+  /**
+   * Count of individual Telegram sends aborted by the per-send timeout this
+   * run. Bounded integer; never includes tokens or message bodies.
+   */
+  sendTimeouts: number;
+  /** Bounded description of the most recent per-send timeout, or null. */
+  lastSendTimeout: string | null;
   lastError: { at: number; message: string } | null;
   targets: StatusTargetSnapshot[];
 }
@@ -115,6 +153,29 @@ export function buildStatusSnapshot(
   status: PollerStatus,
   now: number = Date.now(),
 ): StatusSnapshot {
+  const defaultCounters: PollerCounterSnapshot = {
+    cycles: status.cycles,
+    notificationsSent: status.notificationsSent,
+    notificationsFailed: status.notificationsFailed,
+    eventsSkipped: status.eventsSkipped,
+  };
+  const sinceStart: PollerCounterSnapshot = status.sinceStart
+    ? {
+        cycles: status.sinceStart.cycles,
+        notificationsSent: status.sinceStart.notificationsSent,
+        notificationsFailed: status.sinceStart.notificationsFailed,
+        eventsSkipped: status.sinceStart.eventsSkipped,
+      }
+    : { ...defaultCounters };
+  const cumulative: PollerCounterSnapshot = status.cumulative
+    ? {
+        cycles: status.cumulative.cycles,
+        notificationsSent: status.cumulative.notificationsSent,
+        notificationsFailed: status.cumulative.notificationsFailed,
+        eventsSkipped: status.cumulative.eventsSkipped,
+      }
+    : { ...defaultCounters };
+
   return {
     schemaVersion: STATUS_SCHEMA_VERSION,
     generatedAt: new Date(now).toISOString(),
@@ -122,7 +183,7 @@ export function buildStatusSnapshot(
     running: status.running,
     network: networkLabel(config),
     rpcUrl: config.rpcUrl,
-    chatId: redactChatId(config.chatId),
+    chatId: redactChatId(config.chatId ?? config.chatIds?.[0]),
     pollIntervalMs: config.pollIntervalMs,
     maxNotificationsPerCycle: config.maxNotificationsPerCycle,
     cycles: status.cycles,
@@ -133,19 +194,33 @@ export function buildStatusSnapshot(
     notificationsSent: status.notificationsSent,
     notificationsFailed: status.notificationsFailed,
     eventsSkipped: status.eventsSkipped,
+    sinceStart,
+    cumulative,
+    eventsDeduplicated: status.eventsDeduplicated ?? 0,
     cursorRewinds: status.cursorRewinds ?? 0,
     consecutiveFailures: status.consecutiveFailures,
+    sendTimeouts: status.sendTimeouts ?? 0,
+    lastSendTimeout: status.lastSendTimeout
+      ? boundText(status.lastSendTimeout, MAX_SEND_DURATION_CHARS)
+      : null,
     lastError: status.lastError
       ? { at: status.lastError.at, message: boundText(status.lastError.message) }
       : null,
     targets: status.targets.map((target) => ({
       source: target.source,
       contractId: target.contractId,
+      lastCycleMs: target.lastCycleMs ?? 0,
+      maxCycleMs: target.maxCycleMs ?? 0,
       cursor: target.cursor === null ? null : boundText(target.cursor, MAX_CURSOR_CHARS),
       lastEventLedger: target.lastEventLedger,
       rewindFromLedger:
         typeof target.rewindFromLedger === "number" ? target.rewindFromLedger : null,
+      cursorStale: target.cursorStale === true,
       lastError: target.lastError === null ? null : boundText(target.lastError),
+      lastSendTimeout:
+        target.lastSendTimeout === null || target.lastSendTimeout === undefined
+          ? null
+          : boundText(target.lastSendTimeout, MAX_SEND_DURATION_CHARS),
     })),
   };
 }

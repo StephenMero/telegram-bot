@@ -7,7 +7,7 @@ import test from "node:test";
 import { nativeToScVal, xdr } from "@stellar/stellar-sdk";
 
 import { createPoller } from "../dist/poller.js";
-import { paginatedGetEvents } from "../dist/stellar/events.js";
+import { paginatedGetEvents, readContractEvents } from "../dist/stellar/events.js";
 
 // ── deterministic, offline doubles ───────────────────────────────────────────
 
@@ -182,18 +182,81 @@ test("a page made entirely of duplicates still terminates and returns the cursor
   assert.equal(scan.pages, 1);
 });
 
-test("an event with no id and no tx hash is not silently dropped", async () => {
+// #609 (rpc-guard) rejects a getEvents page whose events lack a string `id`
+// (the RPC spec makes it required) or are not objects, with
+// RpcResponseShapeError, so the poller keeps its cursor and retries instead of
+// guessing. Id-less events therefore never reach page dedup any more; the v2
+// content-derived composite keys they used to get are covered at the unit
+// level in tests/dedup.test.mjs.
+
+const missingId = { name: "RpcResponseShapeError", problem: "event-missing-id" };
+
+test("an event with no id and no tx hash is rejected loudly, never silently dropped", async () => {
   const anonymous = { ...rawEvent("ignored", 40), id: "", txHash: "" };
   const server = serverReturning([{ events: [anonymous], cursor: TIP_CURSOR, latestLedger: TIP }]);
 
-  const scan = await paginatedGetEvents(
-    server,
-    [{ type: "contract", contractIds: [MARKET] }],
-    { startLedger: 1 },
+  await assert.rejects(
+    paginatedGetEvents(server, [{ type: "contract", contractIds: [MARKET] }], { startLedger: 1 }),
+    missingId,
   );
+});
 
-  assert.equal(scan.events.length, 1);
-  assert.equal(scan.duplicates, 0);
+test("id-less events sharing a transaction are rejected, never falsely merged", async () => {
+  const txHash = "cd".repeat(32);
+  const first = { ...rawEvent("", 40), txHash, topic: ["ab", "c"] };
+  const second = { ...rawEvent("", 40), txHash, topic: ["a", "bc"] };
+  const server = serverReturning([
+    { events: [first, second], cursor: TIP_CURSOR, latestLedger: TIP },
+  ]);
+
+  await assert.rejects(
+    paginatedGetEvents(server, [{ type: "contract", contractIds: [MARKET] }], { startLedger: 1 }),
+    missingId,
+  );
+});
+
+test("an id-less event on a later overlapping page rejects the scan, not just that page", async () => {
+  const server = serverReturning([
+    { events: [rawEvent("0000000171798691840-0000000001", 40)], cursor: cursorAt(50, 1), latestLedger: TIP },
+    { events: [{ ...rawEvent("", 40), topic: ["same"] }], cursor: TIP_CURSOR, latestLedger: TIP },
+  ]);
+
+  await assert.rejects(
+    paginatedGetEvents(server, [{ type: "contract", contractIds: [MARKET] }], { startLedger: 1 }),
+    missingId,
+  );
+});
+
+test("non-object entries reject the page with a bounded shape error", async () => {
+  const target = { source: "market", contractId: MARKET };
+  const server = serverReturning([
+    { events: [null, rawEvent("good", 43)], cursor: TIP_CURSOR, latestLedger: TIP },
+  ]);
+
+  await assert.rejects(readContractEvents(server, target, { startLedger: 1 }), {
+    name: "RpcResponseShapeError",
+    problem: "event-not-an-object",
+  });
+});
+
+test("malformed XDR in a well-formed entry never crashes the scanner", async () => {
+  const target = { source: "market", contractId: MARKET };
+  const malformed = {
+    ...rawEvent("bad-xdr", 42),
+    topic: ["!!!not-xdr!!!"],
+    value: "!!!also-not-xdr!!!",
+  };
+  const server = serverReturning([
+    { events: [malformed, rawEvent("good", 43)], cursor: TIP_CURSOR, latestLedger: TIP },
+  ]);
+
+  const scan = await readContractEvents(server, target, { startLedger: 1 });
+
+  assert.ok(scan.events.some((e) => e.eventId === "good"), "the decodable event survives");
+  const degraded = scan.events.find((e) => e.eventId === "bad-xdr");
+  assert.ok(degraded, "the malformed entry is decoded, not dropped");
+  assert.equal(degraded.payload.name, "unknown");
+  assert.ok(typeof degraded.payload.reason === "string" && degraded.payload.reason.length > 0);
 });
 
 // ── poller: cross-cycle + restart integration ────────────────────────────────
@@ -314,6 +377,31 @@ test("a corrupt cursor file still cold-starts and notifies (dedup never wedges t
   try {
     await waitFor(() => poller.status().notificationsSent >= 1);
     assert.equal(sent.length, 1);
+  } finally {
+    await poller.stop();
+  }
+});
+
+test("an id-less event is never notified and the poller keeps running", async (t) => {
+  const cursorFile = await withTempCursor(t);
+  const event = claimCreatedEvent("", 80);
+  const sent = [];
+
+  const poller = createPoller({
+    config: baseConfig(cursorFile),
+    server: redeliveringServer(event),
+    send: async (text) => {
+      sent.push(text);
+    },
+  });
+
+  await poller.start();
+  try {
+    await waitFor(() => poller.status().cycles >= 3);
+    assert.equal(sent.length, 0, "a rejected page notifies nothing");
+    assert.equal(poller.status().running, true, "the poller survives the bad page");
+    // The failure is recorded against the market target on every cycle.
+    assert.match(poller.status().lastError?.message ?? "", /^market: .*missing a valid string id/);
   } finally {
     await poller.stop();
   }

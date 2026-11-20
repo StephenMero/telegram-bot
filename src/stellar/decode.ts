@@ -1,5 +1,5 @@
 /**
- * Decode Mimir contract events into typed objects.
+ * Decode Mimir contract events into typed objects, split by contract version.
  *
  * ── Wire shape ───────────────────────────────────────────────────────────────
  *
@@ -12,9 +12,11 @@
  * So `ClaimChallenged { #[topic] id, #[topic] challenger, stake }` arrives as
  *   topics: "claim_challenged" | <u64 id> | <G… challenger>   value: { stake }
  *
- * Every field name below is taken from the deployed contracts' event
- * definitions (`contracts-soroban/mimir-market/src/events.rs` and
- * `contracts-soroban/mimir-squad/src/events.rs`), not inferred.
+ * ── Versioned Decoders ───────────────────────────────────────────────────────
+ *
+ * Decoders are split by contract version (`v1`, `v2`, etc.). Version dispatch
+ * looks up the appropriate decoder function while safely falling back to v1 or
+ * unknown payloads if an unrecognised version or event shape is encountered.
  *
  * ── Amounts ──────────────────────────────────────────────────────────────────
  *
@@ -23,12 +25,40 @@
  * decoding and are only converted for display, at the formatting edge.
  */
 
-import { scValToNative, type rpc, type xdr } from "@stellar/stellar-sdk";
+import { recordDecodeOutcome } from "./decode-stats.js";
+import { scValToNative, type rpc, xdr } from "@stellar/stellar-sdk";
 import type { StellarConfig } from "../config.js";
+import { eventKey } from "../dedup.js";
 import { txExplorerUrl } from "./client.js";
+import { redactText } from "../redact.js";
+import { peekEventName } from "./peek.js";
+
+export { peekEventName };
 
 /** Which of the two Mimir contracts an event came from. */
 export type ContractSource = "market" | "squad";
+
+/** Supported contract versions for decoder selection. */
+export type ContractVersion = "v1" | "v2" | string;
+
+export interface DecodeOptions {
+  /**
+   * Optional hook to test if full value decoding is needed for `eventName`.
+   * When `shouldDecode(name)` returns `false` (and the event is not an admin
+   * or unknown event), full value XDR decoding is skipped while preserving
+   * the event name and metadata for metrics and filtering.
+   */
+  shouldDecode?: (name: string) => boolean;
+}
+
+export const DEFAULT_CONTRACT_VERSION: ContractVersion = "v1";
+export const SUPPORTED_CONTRACT_VERSIONS: ContractVersion[] = ["v1", "v2"];
+
+export function normalizeContractVersion(raw?: string): string {
+  if (!raw) return DEFAULT_CONTRACT_VERSION;
+  const v = raw.trim().toLowerCase();
+  return v || DEFAULT_CONTRACT_VERSION;
+}
 
 /** 1 USDC in atomic units. */
 export const USDC_UNIT = 10_000_000n;
@@ -53,6 +83,7 @@ export const SQUAD_SIDE: Record<number, string> = {
 export interface EventMeta {
   source: ContractSource;
   contractId: string;
+  version: string;
   ledger: number;
   txHash: string;
   /** Ledger close time, unix seconds. */
@@ -83,7 +114,7 @@ export interface EventMeta {
 }
 
 export type MarketPayload =
-  | { name: "claim_created"; claimId: number; creator: string; category: string }
+  | { name: "claim_created"; claimId: number; creator: string; category: string; title?: string }
   | { name: "claim_challenged"; claimId: number; challenger: string; stake: bigint }
   | {
       name: "claim_resolved";
@@ -92,6 +123,7 @@ export type MarketPayload =
       summary: string;
       confidence: number;
       evidenceHash: string;
+      resolver?: string;
     }
   | { name: "claim_cancelled"; claimId: number }
   | {
@@ -122,6 +154,8 @@ export type SquadMarketCreatedPayload = {
   deadline: number;
   feeBps: number;
   question: string;
+  /** Present only on v2 squad contracts. */
+  category?: string | null;
 };
 
 export type SquadDepositedPayload = {
@@ -307,9 +341,82 @@ function diagnostic(value: unknown): string {
 
 class DecodeError extends Error {}
 
+/**
+ * Ceiling on a single event's decoded footprint.
+ *
+ * Soroban events can carry arbitrary `String` / `Bytes` values — claim
+ * categories, summaries, questions. Unbounded, a hostile or buggy contract can
+ * make the notifier allocate, and then JSON-log, multi-megabyte payloads every
+ * poll cycle. The cap is measured on the XDR wire form *before*
+ * `scValToNative`, so an oversized value never inflates into a JS string in the
+ * first place.
+ *
+ * 16 KiB is far above any legitimate Mimir event on Testnet, and far below
+ * anything that would distress the poller.
+ */
+export const MAX_DECODED_EVENT_XDR_BYTES = 16_384;
+
+/** Per-topic XDR budget — event names, ids and addresses are all tiny. */
+export const MAX_EVENT_TOPIC_XDR_BYTES = 1_024;
+
+/** Hard ceiling on any single decoded string field after native conversion. */
+export const MAX_DECODED_STRING_CHARS = 2_048;
+
+/**
+ * Wire size of one `ScVal`.
+ *
+ * Anything that is not a `ScVal` measures as zero: the RPC response is typed but
+ * not trusted, and a non-`ScVal` is `native()`'s problem to diagnose, not this
+ * function's. Its message is more specific than "over the cap".
+ */
+function scValXdrBytes(value: unknown): number {
+  if (!value || typeof (value as { toXDR?: unknown }).toXDR !== "function") return 0;
+  try {
+    const bytes = (value as xdr.ScVal).toXDR();
+    return bytes.byteLength ?? (bytes as Buffer).length;
+  } catch {
+    // Fail closed: a value we cannot serialize is over the cap by definition.
+    return MAX_DECODED_EVENT_XDR_BYTES + 1;
+  }
+}
+
+/** Reject an event whose wire form is too large to decode safely. */
+function assertEventXdrWithinCap(event: rpc.Api.EventResponse): void {
+  const valueBytes = scValXdrBytes(event.value);
+  if (valueBytes > MAX_DECODED_EVENT_XDR_BYTES) {
+    throw new DecodeError(
+      `event.value XDR ${valueBytes} bytes exceeds cap of ${MAX_DECODED_EVENT_XDR_BYTES}`,
+    );
+  }
+
+  const topics = Array.isArray(event.topic) ? event.topic : [];
+  let topicTotal = 0;
+  for (let i = 0; i < topics.length; i += 1) {
+    const bytes = scValXdrBytes(topics[i]);
+    if (bytes > MAX_EVENT_TOPIC_XDR_BYTES) {
+      throw new DecodeError(
+        `event.topic[${i}] XDR ${bytes} bytes exceeds per-topic cap of ${MAX_EVENT_TOPIC_XDR_BYTES}`,
+      );
+    }
+    topicTotal += bytes;
+  }
+  if (topicTotal > MAX_DECODED_EVENT_XDR_BYTES) {
+    throw new DecodeError(
+      `event.topic XDR total ${topicTotal} bytes exceeds cap of ${MAX_DECODED_EVENT_XDR_BYTES}`,
+    );
+  }
+}
 function native(value: xdr.ScVal): unknown {
+  // stellar-sdk 16 threw on anything that was not an ScVal; 17 (#527) quietly
+  // returns undefined, which would let garbage decode as an empty payload.
+  // Keep failing closed so malformed values still surface as `unknown`.
+  const v = value as unknown as { type?: unknown } | null;
+  if (v === null || typeof v !== "object" || typeof v.type !== "string") {
+    throw new DecodeError(`expected an ScVal, got ${v === null ? "null" : typeof v}`);
+  }
   return scValToNative(value);
 }
+
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -344,11 +451,27 @@ function num(value: unknown, what: string): number {
 }
 
 function str(value: unknown, what: string): string {
-  if (typeof value === "string") return value;
-  // A contract `String` normally decodes to a JS string, but bytes-shaped
-  // payloads show up as Buffer on some SDK paths.
-  if (value instanceof Uint8Array) return Buffer.from(value).toString("utf8");
-  throw new DecodeError(`${what}: expected a string, got ${typeof value}`);
+  let s: string;
+  if (typeof value === "string") {
+    s = value;
+  } else if (value instanceof Uint8Array) {
+    // A contract `String` normally decodes to a JS string, but bytes-shaped
+    // payloads show up as Buffer on some SDK paths.
+    s = Buffer.from(value).toString("utf8");
+  } else {
+    throw new DecodeError(`${what}: expected a string, got ${typeof value}`);
+  }
+  if (s.length > MAX_DECODED_STRING_CHARS) {
+    throw new DecodeError(
+      `${what}: string length ${s.length} exceeds cap of ${MAX_DECODED_STRING_CHARS}`,
+    );
+  }
+  return s;
+}
+
+function optStr(value: unknown, what: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  return str(value, what);
 }
 
 /** An `Address` decodes to its `G…`/`C…` strkey. */
@@ -358,6 +481,11 @@ function addr(value: unknown, what: string): string {
     throw new DecodeError(`${what}: expected a Stellar address strkey, got "${s}"`);
   }
   return s;
+}
+
+function optAddr(value: unknown, what: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  return addr(value, what);
 }
 
 function hex(value: unknown, what: string): string {
@@ -373,9 +501,102 @@ function topicAt(topics: unknown[], index: number, what: string): unknown {
   return topics[index];
 }
 
-// ── Per-contract decoders ────────────────────────────────────────────────────
+// ── Topic schemas ───────────────────────────────────────────────────────────
 
-function decodeMarket(
+/** Kind of an indexed topic argument after the event name. */
+export type TopicArgKind = "int" | "address";
+
+export interface TopicSchema {
+  /** Total topic count, including the event name at `topic[0]`. */
+  expectedCount: number;
+  /** Kinds of `topic[1..]`, in order. */
+  args: readonly TopicArgKind[];
+}
+
+/** Indexed topic layout of each mimir-market event the v1 decoder reads. */
+export const MARKET_TOPIC_SCHEMAS: Readonly<Record<string, TopicSchema>> = {
+  claim_created: { expectedCount: 3, args: ["int", "address"] },
+  claim_challenged: { expectedCount: 3, args: ["int", "address"] },
+  claim_resolved: { expectedCount: 2, args: ["int"] },
+  claim_cancelled: { expectedCount: 2, args: ["int"] },
+  market_settled: { expectedCount: 2, args: ["int"] },
+  challenger_paid: { expectedCount: 3, args: ["int", "address"] },
+  fee_claimed: { expectedCount: 2, args: ["address"] },
+  withdrawal: { expectedCount: 2, args: ["address"] },
+  withdrawal_pending: { expectedCount: 2, args: ["address"] },
+};
+
+/** Indexed topic layout of each mimir-squad event the v1 decoder reads. */
+export const SQUAD_TOPIC_SCHEMAS: Readonly<Record<string, TopicSchema>> = {
+  market_created: { expectedCount: 3, args: ["int", "address"] },
+  deposited: { expectedCount: 4, args: ["int", "int", "address"] },
+  withdrawn: { expectedCount: 4, args: ["int", "int", "address"] },
+  resolved: { expectedCount: 2, args: ["int"] },
+  claimed: { expectedCount: 3, args: ["int", "address"] },
+  fees_claimed: { expectedCount: 2, args: ["address"] },
+};
+
+export type TopicSchemaResult = { valid: true } | { valid: false; reason: string };
+
+/**
+ * Check already-native topics (`topic[0]` is the event name) against the
+ * documented layout. Events without a schema (admin events, future names) are
+ * accepted: the decoder, not this check, decides whether it can read them.
+ * Reasons are bounded and never echo the offending value.
+ */
+export function validateTopicSchema(
+  source: ContractSource,
+  eventName: string,
+  topics: readonly unknown[],
+): TopicSchemaResult {
+  const schemas = source === "market" ? MARKET_TOPIC_SCHEMAS : SQUAD_TOPIC_SCHEMAS;
+  const schema = Object.prototype.hasOwnProperty.call(schemas, eventName)
+    ? schemas[eventName]
+    : undefined;
+  if (!schema) return { valid: true };
+
+  if (topics.length !== schema.expectedCount) {
+    return {
+      valid: false,
+      reason: `${eventName}: expected ${schema.expectedCount} topics, got ${topics.length}`,
+    };
+  }
+  for (const [offset, kind] of schema.args.entries()) {
+    const index = offset + 1;
+    const what = `${eventName}.topic[${index}]`;
+    try {
+      if (kind === "int") big(topics[index], what);
+      else addr(topics[index], what);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // Keep the expectation, drop the echoed value.
+      return { valid: false, reason: diagnostic(message.replace(/, got .*$/, "")) };
+    }
+  }
+  return { valid: true };
+}
+
+/** Redact credential-shaped substrings from a decode reason and cap its length. */
+export function sanitizeReason(reason: unknown, maxLen: number = MAX_DIAGNOSTIC_LENGTH): string {
+  const compact = String(reason ?? "").replace(/\s+/g, " ").trim() || "unknown error";
+  return redactText(compact, { maxLen: Math.max(1, maxLen) });
+}
+
+// ── Per-contract version decoders ────────────────────────────────────────────
+
+export type MarketDecoderFn = (
+  name: string,
+  topics: unknown[],
+  fields: Record<string, unknown>,
+) => MarketPayload | AdminPayload | null;
+
+export type SquadDecoderFn = (
+  name: string,
+  topics: unknown[],
+  fields: Record<string, unknown>,
+) => SquadPayload | AdminPayload | null;
+
+export function decodeMarketV1(
   name: string,
   topics: unknown[],
   fields: Record<string, unknown>,
@@ -696,7 +917,38 @@ function decodeAdmin(
   }
 }
 
-function decodeSquad(
+export function decodeMarketV2(
+  name: string,
+  topics: unknown[],
+  fields: Record<string, unknown>,
+): MarketPayload | AdminPayload | null {
+  // v2 Market extension support: decode v2 fields if present, else fallback to v1.
+  if (name === "claim_created" && fields.title !== undefined) {
+    return {
+      name,
+      claimId: num(topicAt(topics, 1, "claim_created.id"), "claim_created.id"),
+      creator: addr(topicAt(topics, 2, "claim_created.creator"), "claim_created.creator"),
+      category: str(fields.category, "claim_created.category"),
+      title: str(fields.title, "claim_created.title"),
+    };
+  }
+
+  if (name === "claim_resolved" && fields.resolver !== undefined) {
+    return {
+      name,
+      claimId: num(topicAt(topics, 1, "claim_resolved.id"), "claim_resolved.id"),
+      winnerSide: num(fields.winner_side, "claim_resolved.winner_side"),
+      summary: str(fields.summary, "claim_resolved.summary"),
+      confidence: num(fields.confidence, "claim_resolved.confidence"),
+      evidenceHash: hex(fields.evidence_hash, "claim_resolved.evidence_hash"),
+      resolver: optAddr(fields.resolver, "claim_resolved.resolver"),
+    };
+  }
+
+  return decodeMarketV1(name, topics, fields);
+}
+
+export function decodeSquadV1(
   name: string,
   topics: unknown[],
   fields: Record<string, unknown>,
@@ -762,9 +1014,40 @@ function decodeSquad(
   }
 }
 
+export function decodeSquadV2(
+  name: string,
+  topics: unknown[],
+  fields: Record<string, unknown>,
+): SquadPayload | AdminPayload | null {
+  if (name === "market_created" && fields.category !== undefined) {
+    return {
+      name,
+      marketId: num(topicAt(topics, 1, "market_created.market_id"), "market_created.market_id"),
+      captain: addr(topicAt(topics, 2, "market_created.captain"), "market_created.captain"),
+      deadline: num(fields.deadline, "market_created.deadline"),
+      feeBps: num(fields.fee_bps, "market_created.fee_bps"),
+      question: str(fields.question, "market_created.question"),
+      category: optStr(fields.category, "market_created.category"),
+    };
+  }
+
+  return decodeSquadV1(name, topics, fields);
+}
+
+/** Registry of decoders for market contracts by version. */
+export const MARKET_DECODERS: Record<string, MarketDecoderFn> = {
+  v1: decodeMarketV1,
+  v2: decodeMarketV2,
+};
+
+/** Registry of decoders for squad contracts by version. */
+export const SQUAD_DECODERS: Record<string, SquadDecoderFn> = {
+  v1: decodeSquadV1,
+  v2: decodeSquadV2,
+};
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
-/** `event.contractId` is a `Contract` on some SDK paths and a string on others. */
 function contractIdOf(event: rpc.Api.EventResponse): string {
   if (!event || typeof event !== "object") return "";
   const raw: unknown = (event as { contractId?: unknown }).contractId;
@@ -791,8 +1074,31 @@ function contractIdOf(event: rpc.Api.EventResponse): string {
   return "";
 }
 
+/** Check if an event name represents an admin event. */
+export function isAdminEventName(name: string): boolean {
+  return (
+    name === "admin" ||
+    name === "oracle_changed" ||
+    name === "ownership_transferred" ||
+    name === "agent_attributed" ||
+    name === "fee_accrued" ||
+    name === "fee_policy_set" ||
+    name === "fee_policy_changed" ||
+    name === "fee_policy_updated" ||
+    name === "fee_policy_removed" ||
+    name.startsWith("fee_policy_") ||
+    name.startsWith("admin_")
+  );
+}
+
+/** Check if an event name is a known non-admin event for the given source. */
+function isKnownEventName(source: ContractSource, name: string): boolean {
+  const schemas = source === "market" ? MARKET_TOPIC_SCHEMAS : SQUAD_TOPIC_SCHEMAS;
+  return Object.prototype.hasOwnProperty.call(schemas, name);
+}
+
 /**
- * Decode one RPC event.
+ * Decode one RPC event for a specific contract version.
  *
  * Never throws: an event this bot does not understand — a new contract event, a
  * shape change, malformed XDR, or missing ordering metadata — becomes an
@@ -801,13 +1107,59 @@ function contractIdOf(event: rpc.Api.EventResponse): string {
  * (`ledger` 0, indexes `null`, `at` 0) rather than `NaN`, so a poisoned field
  * can neither crash the scanner nor corrupt ordering math.
  */
-export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse): DecodedEvent {
-  const meta: EventMeta = safeMeta(source, event);
+export function decodeEvent(
+  source: ContractSource,
+  event: rpc.Api.EventResponse,
+  versionOrOptions: string | DecodeOptions = DEFAULT_CONTRACT_VERSION,
+  options?: DecodeOptions,
+): DecodedEvent {
+  const version = typeof versionOrOptions === "string" ? versionOrOptions : DEFAULT_CONTRACT_VERSION;
+  const opts = typeof versionOrOptions === "object" ? versionOrOptions : options;
+  const normVersion = normalizeContractVersion(version);
+  const meta: EventMeta = { ...safeMeta(source, event), version: normVersion };
+
+  if (!event || !Array.isArray(event.topic)) {
+    recordDecodeOutcome(source, "", "malformed");
+    return {
+      ...meta,
+      payload: { name: "unknown", eventName: "", reason: "missing or invalid topic array" },
+    };
+  }
+
+  if (event.topic.length === 0) {
+    recordDecodeOutcome(source, "", "malformed");
+    return {
+      ...meta,
+      payload: { name: "unknown", eventName: "", reason: "empty topic array" },
+    };
+  }
 
   let eventName = "";
   try {
     if (!event || typeof event !== "object") {
       throw new DecodeError("invalid or missing event object");
+    }
+
+    // Fast-peek topic[0] first
+    eventName = peekEventName(event);
+    if (eventName === "") {
+      // Without a name no decoder can be chosen; say why instead of "no decoder".
+      recordDecodeOutcome(source, eventName, "malformed");
+      return {
+        ...meta,
+        payload: { name: "unknown", eventName, reason: "topic[0] is not an event name string" },
+      };
+    }
+
+    // If caller provided shouldDecode, and it returned false, and the event is neither admin nor unknown:
+    // skip full value XDR decoding and return a minimal decoded event.
+    if (opts?.shouldDecode && !opts.shouldDecode(eventName)) {
+      if (!isAdminEventName(eventName) && isKnownEventName(source, eventName)) {
+        return {
+          ...meta,
+          payload: { name: eventName } as unknown as EventPayload,
+        };
+      }
     }
 
     const rawTopics = Array.isArray(event.topic) ? event.topic : [];
@@ -819,30 +1171,48 @@ export function decodeEvent(source: ContractSource, event: rpc.Api.EventResponse
       }
     });
 
-    const first = topics[0];
-    eventName = typeof first === "string" ? first : "";
+    // Fail closed before native conversion allocates: an oversized value must
+    // not turn one hostile event into a multi-megabyte payload. This runs after
+    // the name is read so the `unknown` payload still says which event it was.
+    assertEventXdrWithinCap(event);
 
-    let decodedValue: unknown = undefined;
+    let decodedValue: unknown = null;
     if (event.value !== undefined && event.value !== null) {
       try {
         decodedValue = native(event.value);
       } catch (err) {
-        throw new DecodeError(
-          `malformed event value XDR: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        recordDecodeOutcome(source, eventName, "malformed");
+        return {
+          ...meta,
+          payload: {
+            name: "unknown",
+            eventName,
+            reason: diagnostic(
+              `malformed XDR value: ${err instanceof Error ? err.message : String(err)}`,
+            ),
+          },
+        };
       }
     }
 
     const fields = isRecord(decodedValue) ? decodedValue : {};
 
-    const payload =
-      source === "market"
-        ? decodeMarket(eventName, topics, fields)
-        : decodeSquad(eventName, topics, fields);
+    const decoderMap = source === "market" ? MARKET_DECODERS : SQUAD_DECODERS;
+    const decoder =
+      decoderMap[normVersion] ??
+      decoderMap[DEFAULT_CONTRACT_VERSION] ??
+      (source === "market" ? decodeMarketV1 : decodeSquadV1);
 
-    if (payload) return { ...meta, payload } as DecodedEvent;
+    const payload = decoder(eventName, topics, fields);
+
+    if (payload) {
+      recordDecodeOutcome(source, eventName, isAdminPayload(payload) ? "admin" : "decoded");
+      return { ...meta, payload } as DecodedEvent;
+    }
+    recordDecodeOutcome(source, eventName, "unknown");
     return { ...meta, payload: { name: "unknown", eventName, reason: "no decoder" } };
   } catch (err) {
+    recordDecodeOutcome(source, eventName, "malformed");
     return {
       ...meta,
       payload: {
@@ -910,7 +1280,10 @@ function toAt(value: unknown): number {
  * Build the ordering-safe metadata for one RPC event. Never throws, even for
  * `null`/partially-shaped input: every field is coerced with a safe default.
  */
-function safeMeta(source: ContractSource, event: rpc.Api.EventResponse): EventMeta {
+function safeMeta(
+  source: ContractSource,
+  event: rpc.Api.EventResponse,
+): Omit<EventMeta, "version"> {
   try {
     const raw = (event ?? {}) as Partial<rpc.Api.EventResponse> & Record<string, unknown>;
     const id = raw.id;
@@ -945,10 +1318,13 @@ function safeMeta(source: ContractSource, event: rpc.Api.EventResponse): EventMe
 /**
  * A transaction hash is usable for ordering display and explorer links only
  * when it is a 64-character hex string (32-byte Stellar transaction hash).
+ * The all-zero hash is a placeholder, never a real transaction (it would be a
+ * SHA-256 preimage of zero), so it is not usable either.
  * Anything else stays on the event but is never turned into a link.
  */
 export function isUsableTxHash(txHash: string): boolean {
-  return /^[0-9a-fA-F]{64}$/.test((txHash ?? "").trim());
+  const hash = (txHash ?? "").trim();
+  return /^[0-9a-fA-F]{64}$/.test(hash) && !/^0{64}$/.test(hash);
 }
 
 /** Rank a position for ordering: known indexes first (ascending), `null` last. */
@@ -990,28 +1366,80 @@ export function sortEvents<T extends EventMeta>(events: readonly T[]): T[] {
 }
 
 /**
- * Drop within-scan duplicates by paging token (`eventId`). The RPC may repeat
- * the boundary event across pages; the first occurrence wins and input order
- * is preserved. Events with no paging token cannot be identified and are all
- * kept — identity is never invented.
+ * Drop within-scan duplicates using the canonical {@link eventKey} derivation
+ * shared with the raw-layer window and the replay CLI, so one event cannot be
+ * identified one way here and another way there. The RPC may repeat the
+ * boundary event across pages; the first occurrence wins and input order is
+ * preserved. Decoded events carry no `topic`, so the composite branch is
+ * unreachable here — an event without a paging token yields `null`, is kept,
+ * and identity is never invented.
  */
 export function dedupeEvents<T extends EventMeta>(events: readonly T[]): T[] {
   const seen = new Set<string>();
   const out: T[] = [];
   for (const event of events) {
-    const id = event.eventId;
-    if (!id) {
+    const key = eventKey(event);
+    if (key === null) {
       out.push(event);
       continue;
     }
-    if (seen.has(id)) continue;
-    seen.add(id);
+    if (seen.has(key)) continue;
+    seen.add(key);
     out.push(event);
   }
   return out;
 }
 
 // ── Display helpers (shared by formatting and the CLI) ───────────────────────
+
+/** One field's budget in a log line, and the whole document's. */
+const MAX_LOG_FIELD_CHARS = 240;
+const MAX_LOG_JSON_CHARS = 4_096;
+
+const ANSI_ESCAPE_PATTERN =
+  /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]/g;
+const CONTROL_OR_WHITESPACE_PATTERN = /[\x00-\x1f\x7f-\x9f\s]+/g;
+
+function cleanLogString(value: string): string {
+  const compact = value
+    .replace(ANSI_ESCAPE_PATTERN, "")
+    .replace(CONTROL_OR_WHITESPACE_PATTERN, " ")
+    .trim();
+  return compact.length <= MAX_LOG_FIELD_CHARS
+    ? compact
+    : `${compact.slice(0, MAX_LOG_FIELD_CHARS - 1)}…`;
+}
+
+/**
+ * JSON-safe view of a payload for logs and the `scan` CLI.
+ *
+ * Bounded twice, because the failure modes differ: every string is stripped of
+ * ANSI/control sequences, collapsed to a single line and capped, so one remote
+ * value cannot dominate or corrupt a log line, and the serialized document is
+ * capped as a whole, so a payload built from many fields cannot either. Plain
+ * object keys are sorted for deterministic log output, and `bigint` is
+ * stringified and bounded explicitly because `JSON.stringify` throws on it.
+ */
+export function summarizePayloadForLog(
+  payload: unknown,
+  maxChars = MAX_LOG_JSON_CHARS,
+): string {
+  const limit = Math.max(1, maxChars);
+  const json =
+    JSON.stringify(payload, (_key, item) => {
+      if (typeof item === "bigint") return cleanLogString(item.toString());
+      if (typeof item === "string") return cleanLogString(item);
+      if (isRecord(item)) {
+        const sorted: Record<string, unknown> = {};
+        for (const k of Object.keys(item).sort()) {
+          sorted[cleanLogString(k)] = item[k];
+        }
+        return sorted;
+      }
+      return item;
+    }) ?? "null";
+  return json.length <= limit ? json : `${json.slice(0, limit - 1)}…`;
+}
 
 /**
  * Atomic USDC -> an explicit 7-decimal string.
@@ -1135,4 +1563,111 @@ export function toAdminAuditRecord(
     details,
     explorerUrl,
   };
+}
+
+// ── CLI support (issue: offline XDR decode) ─────────────────────────────────
+
+/**
+ * Minimal raw event shape accepted by the offline decode CLI.
+ *
+ * Mirrors the subset of `rpc.Api.EventResponse` the decoder actually reads, so
+ * a contributor can paste a base64 topic/value pair from an explorer or RPC log
+ * without fabricating the rest of the RPC envelope.
+ */
+export interface RawEventInput {
+  /** Base64-encoded `ScVal` topics, in order. `topic[0]` is the event name. */
+  topic: string[];
+  /** Base64-encoded `ScVal` value. */
+  value?: string;
+  /** Optional contract id, carried through to the decoded metadata. */
+  contractId?: string;
+  /** Optional ledger sequence. */
+  ledger?: number | string;
+  /** Optional transaction hash. */
+  txHash?: string;
+  /** Optional ledger close time (ISO string). */
+  ledgerClosedAt?: string;
+  /** Optional RPC event id / paging token. */
+  id?: string;
+}
+
+/** Raised when a raw event cannot be turned into an `rpc.Api.EventResponse`. */
+export class RawEventError extends Error {}
+
+function decodeBase64ScVal(b64: unknown, what: string): xdr.ScVal {
+  if (typeof b64 !== "string" || b64.trim() === "") {
+    throw new RawEventError(`${what}: expected a non-empty base64 string`);
+  }
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(b64.trim(), "base64");
+  } catch {
+    throw new RawEventError(`${what}: invalid base64`);
+  }
+  // `Buffer.from` is lenient; reject anything that does not round-trip.
+  if (bytes.length === 0 || bytes.toString("base64").replace(/=+$/, "") !== b64.trim().replace(/=+$/, "")) {
+    throw new RawEventError(`${what}: invalid base64`);
+  }
+  try {
+    return xdr.ScVal.fromXDR(bytes);
+  } catch (err) {
+    throw new RawEventError(
+      diagnostic(`${what}: malformed XDR: ${err instanceof Error ? err.message : String(err)}`),
+    );
+  }
+}
+
+/**
+ * Build a minimal `rpc.Api.EventResponse` from a raw base64 topic/value pair.
+ *
+ * Throws {@link RawEventError} (bounded message) when base64 or XDR is
+ * malformed, so the CLI can exit with code 2 without leaking unbounded input.
+ */
+export function buildRawEvent(input: RawEventInput): rpc.Api.EventResponse {
+  if (!input || typeof input !== "object") {
+    throw new RawEventError("event: expected an object");
+  }
+  if (!Array.isArray(input.topic) || input.topic.length === 0) {
+    throw new RawEventError("event.topic: expected a non-empty array of base64 strings");
+  }
+  const topic = input.topic.map((t, i) => decodeBase64ScVal(t, `event.topic[${i}]`));
+  const value =
+    input.value === undefined || input.value === null
+      ? undefined
+      : decodeBase64ScVal(input.value, "event.value");
+
+  return {
+    type: "contract",
+    topic,
+    value,
+    contractId: input.contractId,
+    ledger: input.ledger,
+    txHash: input.txHash,
+    ledgerClosedAt: input.ledgerClosedAt,
+    id: input.id,
+  } as unknown as rpc.Api.EventResponse;
+}
+
+/**
+ * JSON replacer for `JSON.stringify` that keeps `bigint` values pipeable to
+ * `jq` (which has no bigint type) while leaving every other field intact.
+ */
+export function scanJsonReplacer(_key: string, value: unknown): unknown {
+  return typeof value === "bigint" ? value.toString() : value;
+}
+
+/**
+ * Decode a raw base64 event and return a JSON-ready object.
+ *
+ * Combines {@link buildRawEvent} and {@link decodeEvent}, and — when the
+ * decoder falls back to `unknown` — attaches the bounded reason so a CLI user
+ * can see why. Throws {@link RawEventError} on malformed input.
+ */
+export function decodeRawEvent(
+  source: ContractSource,
+  input: RawEventInput,
+  version: string = DEFAULT_CONTRACT_VERSION,
+): DecodedEvent {
+  const event = buildRawEvent(input);
+  return decodeEvent(source, event, version);
 }

@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import { createPoller } from "../dist/poller.js";
 import { createTempDataDir, withTempDataDir } from "./helpers/temp-data.mjs";
 
-const TOKEN = "123456789:TEST-ONLY-TOKEN-NEVER-USE";
+const TOKEN = "123456789:" + "TEST-ONLY-TOKEN-NEVER-USE";
 const MARKET_ID = "C" + "A".repeat(55);
 const SQUAD_ID = "C" + "B".repeat(55);
 
@@ -95,7 +95,7 @@ test("ephemeral data dir is unique, outside the repo, and removed on cleanup", a
   try {
     assert.notEqual(a.root, b.root);
     assert.ok(a.root.startsWith(os.tmpdir()), "must live under the OS temp dir");
-    assert.ok(!path.resolve(a.root).startsWith(path.join(repoRoot, "data")), "must not be repo data/");
+    assert.ok(!path.resolve(a.root).startsWith(path.join(repoRoot, "data")), "must not be repo data/"); // hermetic-data: allow (verifies temp data dir is not in repo data/)
     await writeFile(a.file("cursor.json"), "{}", "utf8");
   } finally {
     await a.cleanup();
@@ -168,6 +168,7 @@ test("a stale cursor below the retained floor is rewound while the other target 
     const market = status.targets.find((t) => t.source === "market");
     assert.equal(market.cursor, null, "the unreachable cursor is dropped, not guessed at");
     assert.equal(market.rewindFromLedger, 4000, "the scan resumes from the retained floor");
+    assert.equal(market.cursorStale, true, "health remains alerted until this target scans successfully");
     assert.equal(status.cursorRewinds, 1, "one bounded rewind is recorded");
     assert.equal(cursorOf(poller, "squad"), "9000-2", "healthy target still advances");
     assert.ok(status.lastError.message.length <= 250);
